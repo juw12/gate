@@ -21,6 +21,8 @@ needs a human.
 | Retention / ref clutter | Merged sessions delete their branch at once; rejected ones keep it for a grace period, then become a gzipped, redacted diff outside Git refs. Traces expire by outcome. |
 | Checkout cost / remote agents | Shared object store, per-agent worktree with optional sparse cone, or `spawn --no-worktree` for agents running in remote sandboxes that push `agent/<id>`. |
 
+Demo page with a recorded run: https://juw12.github.io/gate/
+
 Standard library only. Python â‰¥ 3.11, Git â‰¥ 2.40.
 
 ## How it works
