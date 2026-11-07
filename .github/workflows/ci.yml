@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.11", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # agentgate needs git >= 2.40 (merge-tree --merge-base); Apple's bundled git can be older.
+      - name: Newer git on macOS
+        if: runner.os == 'macOS'
+        run: |
+          brew install git
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+
+      - name: Git identity
+        run: |
+          git --version
+          git config --global user.name ci
+          git config --global user.email ci@example.com
+          git config --global init.defaultBranch main
+
+      - name: Unit + end-to-end tests
+        run: python -m unittest -v test_agentgate
+
+      - name: Demo
+        run: python demo.py
+
+      - name: Throughput benchmark (small)
+        run: python bench.py --sessions 48 --lanes 4 --test-seconds 1 --batch 4
