@@ -3,146 +3,136 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>gate - a merge gate for AI-agent-generated code</title>
-<meta name="description" content="Many parallel agent sessions go in; a small number of tested, risk-tiered, provenance-tagged commits come out. A recorded run of gate's demo.">
+<title>gate - a merge gate for AI-agent code</title>
+<meta name="description" content="Many parallel agent sessions go in; a small number of tested, risk-tiered, provenance-tagged commits come out. One Python file, standard library only.">
+<meta name="theme-color" content="#f7f5ef">
 <style>
-  :root {
-    --bg: #f6f5f1; --ink: #17181c; --soft: #5b5e66; --line: #dcd9d0;
-    --term: #121417; --term-ink: #d6d9de; --ok: #3fb950; --bad: #ff7b72;
-    --warn: #e3b341; --mute: #8b949e; --accent: #0f7b3f;
-  }
-  * { box-sizing: border-box; }
-  html { -webkit-text-size-adjust: 100%; }
-  body { margin: 0; background: var(--bg); color: var(--ink);
-    font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-  a { color: var(--accent); }
-  a:focus-visible, summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
-  .wrap { max-width: 1240px; margin: 0 auto; padding: 0 24px; }
-  header.top { display: flex; justify-content: space-between; align-items: center; padding: 20px 0; }
-  .brand { font: 700 20px/1 ui-monospace, "Cascadia Code", Consolas, monospace; letter-spacing: -.02em; }
-  .brand i { color: var(--accent); font-style: normal; }
-  nav a { margin-left: 18px; font-weight: 600; text-decoration: none; }
-  .hero { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 40px; align-items: start; padding: 28px 0 40px; }
-  h1 { font-size: clamp(34px, 4.4vw, 54px); line-height: 1.05; letter-spacing: -.03em; margin: 0 0 18px; }
-  h1 em { font-style: normal; color: var(--accent); }
-  .lede { font-size: 18px; color: var(--soft); margin: 0 0 24px; }
-  .verdict { display: inline-flex; gap: 10px; align-items: center; background: #fff; border: 1px solid var(--line);
-    border-radius: 999px; padding: 8px 16px; font-weight: 600; margin-bottom: 22px; }
-  .verdict b { color: #fff; background: var(--accent); border-radius: 999px; padding: 2px 10px; }
-  .tiles { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
-  .tiles li { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
-  .tiles b { display: block; font: 700 26px/1.1 ui-monospace, Consolas, monospace; }
-  .tiles span { font-size: 13px; color: var(--soft); }
-  .term { background: var(--term); color: var(--term-ink); border-radius: 14px; overflow: hidden;
-    box-shadow: 0 18px 50px rgba(0,0,0,.18); }
-  .term .bar { display: flex; gap: 7px; align-items: center; padding: 11px 14px; background: #1d2026; font: 13px ui-monospace, Consolas, monospace; color: var(--mute); }
-  .term .bar i { width: 11px; height: 11px; border-radius: 50%; background: #3a3f47; display: inline-block; }
-  .term pre { margin: 0; padding: 16px 18px; overflow-x: auto; font: 13px/1.5 ui-monospace, "Cascadia Code", Consolas, monospace; }
-  .ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); } .mute { color: var(--mute); }
-  section { padding: 36px 0; border-top: 1px solid var(--line); }
-  h2 { font-size: 26px; letter-spacing: -.02em; margin: 0 0 14px; }
-  .grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 28px; }
-  table { border-collapse: collapse; width: 100%; font-size: 15px; background: #fff; }
-  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
-  th { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--soft); }
-  .scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
-  code { font: 14px ui-monospace, Consolas, monospace; background: #ebe8df; padding: 1px 5px; border-radius: 5px; }
-  details { margin-top: 14px; }
-  summary { cursor: pointer; font-weight: 600; }
-  ul.plain { padding-left: 20px; margin: 0; } ul.plain li { margin: 6px 0; }
-  footer { padding: 28px 0 40px; color: var(--soft); font-size: 14px; border-top: 1px solid var(--line); }
-  @media (max-width: 900px) {
-    .hero, .grid2 { grid-template-columns: minmax(0, 1fr); }
-    .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    nav a:not(:last-child) { display: none; }
-  }
+@font-face{font-family:'Source Serif 4';src:url('fonts/SourceSerif4-var.woff2') format('woff2');font-weight:200 900;font-style:normal;font-display:swap}
+@font-face{font-family:'IBM Plex Sans';src:url('fonts/IBMPlexSans-var.woff2') format('woff2');font-weight:100 700;font-style:normal;font-display:swap}
+@font-face{font-family:'IBM Plex Mono';src:url('fonts/IBMPlexMono-400.woff2') format('woff2');font-weight:400;font-style:normal;font-display:swap}
+@font-face{font-family:'IBM Plex Mono';src:url('fonts/IBMPlexMono-500.woff2') format('woff2');font-weight:500;font-style:normal;font-display:swap}
+@font-face{font-family:'IBM Plex Mono';src:url('fonts/IBMPlexMono-600.woff2') format('woff2');font-weight:600;font-style:normal;font-display:swap}
+
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0}
+img,svg{max-width:100%}
+pre{margin:0;overflow-x:auto;white-space:pre}
+.scroll{overflow-x:auto}
+table{border-collapse:collapse;width:100%}
+a:focus-visible,summary:focus-visible,pre:focus-visible{outline:2px solid var(--focus);outline-offset:3px}
+.skip{position:absolute;left:-999px}
+.skip:focus{left:12px;top:12px;background:#fff;color:#000;padding:8px 12px;z-index:9}
+
+.ok{color:var(--t-ok)}.bad{color:var(--t-bad)}.warn{color:var(--t-warn)}.mute{color:var(--t-mute)}
+
+:root{--paper:#f7f5ef;--ink:#1c1d21;--soft:#55575e;--rule:#d6d0c2;--accent:#0f6b3a;--accent-ink:#0b5c2f;
+--panel:#efece3;--focus:#0f6b3a;--t-ok:#0f6b3a;--t-bad:#a3321f;--t-warn:#8a5a00;--t-mute:#5f6167}
+body{background:var(--paper);color:var(--ink);font:16px/1.6 'IBM Plex Sans',system-ui,sans-serif}
+a{color:var(--accent-ink)}
+.sheet{max-width:1040px;margin:0 auto;padding:0 28px}
+.mast{display:flex;justify-content:space-between;align-items:baseline;gap:16px;border-bottom:3px double var(--ink);
+padding:22px 0 12px;flex-wrap:wrap}
+.mast .name{font:600 22px/1 'IBM Plex Mono',monospace;letter-spacing:-.01em}
+.mast nav{display:flex;gap:20px;flex-wrap:wrap;font-size:14px}
+.mast nav a{color:var(--ink);text-decoration:none;border-bottom:1px solid var(--rule)}
+.mast nav a:hover{border-color:var(--ink)}
+.ref{font:500 12px/1.4 'IBM Plex Mono',monospace;color:var(--soft);text-transform:uppercase;letter-spacing:.08em}
+.hero{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:56px;padding:56px 0 48px;
+border-bottom:1px solid var(--rule)}
+h1,h2{font-family:'Source Serif 4',Georgia,serif;font-weight:600;letter-spacing:-.015em}
+h1{font-size:clamp(38px,5.4vw,60px);line-height:1.04;margin:14px 0 20px}
+.lede{font-size:19px;color:var(--soft);max-width:34em;margin:0 0 28px}
+.actions{display:flex;gap:18px;align-items:center;flex-wrap:wrap}
+.btn{display:inline-block;background:var(--accent);color:#fff;text-decoration:none;font-weight:600;
+padding:12px 20px;border-radius:2px}
+.btn:hover{background:var(--accent-ink)}
+.ledger{border:1px solid var(--ink);background:#fbfaf6}
+.ledger h2{font-size:15px;font-family:'IBM Plex Mono',monospace;font-weight:600;margin:0;padding:12px 16px;
+border-bottom:1px solid var(--ink);text-transform:uppercase;letter-spacing:.06em}
+.ledger ol{list-style:none;margin:0;padding:6px 16px 10px}
+.ledger li{display:flex;align-items:baseline;gap:8px;padding:7px 0;border-bottom:1px dotted var(--rule)}
+.ledger li:last-child{border-bottom:0}
+.ledger .n{font:600 22px/1 'IBM Plex Mono',monospace;min-width:2.2ch;text-align:right;font-variant-numeric:tabular-nums}
+.ledger .lead{flex:1;border-bottom:1px dotted #b9b2a1;transform:translateY(-4px)}
+.ledger .l{order:0;flex:0 1 auto}.ledger .lead{order:1}.ledger .n{order:2}
+.stamp{margin:0;padding:14px 16px;border-top:3px double var(--ink);display:flex;justify-content:space-between;
+gap:12px;font:600 14px/1.3 'IBM Plex Mono',monospace;text-transform:uppercase;letter-spacing:.05em}
+.stamp b{color:var(--accent-ink)}
+section{padding:52px 0;border-bottom:1px solid var(--rule)}
+.sec{display:grid;grid-template-columns:150px minmax(0,1fr);gap:32px}
+.sec>.ref{padding-top:10px}
+h2{font-size:32px;line-height:1.15;margin:0 0 18px}
+p{margin:0 0 16px;max-width:42em}
+ul.points{margin:0 0 20px;padding-left:20px;max-width:44em}
+ul.points li{margin:0 0 10px}
+.logtable{font:14px/1.45 'IBM Plex Mono',monospace;border-top:1px solid var(--ink);border-bottom:1px solid var(--ink)}
+.logtable th{text-align:left;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.06em;
+color:var(--soft);padding:10px 12px 8px 0;border-bottom:1px solid var(--ink)}
+.logtable td{padding:5px 12px 5px 0;border-bottom:1px solid #e6e1d5;vertical-align:top}
+.logtable tr:last-child td{border-bottom:0}
+.st-merged{color:var(--t-ok);font-weight:600}.st-rejected{color:var(--t-bad);font-weight:600}
+.st-approved{color:var(--accent-ink)}.st-abandoned{color:var(--t-mute)}
+pre{font:14px/1.55 'IBM Plex Mono',monospace;background:var(--panel);border-left:3px solid var(--ink);padding:16px 18px}
+code{font:.92em 'IBM Plex Mono',monospace;background:var(--panel);padding:1px 4px}
+pre code{background:none;padding:0}
+details{margin-top:20px}
+summary{cursor:pointer;font-weight:600}
+details pre{margin-top:12px;max-height:420px}
+.note{font-size:14px;color:var(--soft)}
+table.bench{font-variant-numeric:tabular-nums;border-top:1px solid var(--ink);border-bottom:1px solid var(--ink);margin:6px 0 16px}
+table.bench th{text-align:left;font-size:13px;color:var(--soft);font-weight:600;padding:10px 14px 8px 0;border-bottom:1px solid var(--ink)}
+table.bench th,table.bench td{white-space:nowrap}
+table.bench td{padding:9px 14px 9px 0;border-bottom:1px solid #e6e1d5;font-family:'IBM Plex Mono',monospace;font-size:14px}
+.two{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:40px}
+h3{font:600 15px/1.3 'IBM Plex Sans',sans-serif;text-transform:uppercase;letter-spacing:.06em;margin:0 0 12px}
+footer{padding:28px 0 48px;font-size:14px;color:var(--soft);display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
+@media (max-width:820px){
+.hero,.two{grid-template-columns:minmax(0,1fr);gap:36px}
+.sec{grid-template-columns:minmax(0,1fr);gap:4px}
+.sheet{padding:0 18px}
+.hide-sm{display:none}
+}
+
+
+.strip{padding:14px 16px 4px;border-top:1px solid var(--ink)}
+.strip .cap{display:flex;justify-content:space-between;gap:8px;font:500 11px/1.3 'IBM Plex Mono',monospace;
+text-transform:uppercase;letter-spacing:.07em;color:var(--soft);margin-bottom:8px}
+.cells{display:grid;grid-template-columns:repeat(26,minmax(0,1fr));gap:2px}
+.cells i{display:block;height:26px;background:var(--t-ok)}
+.cells i.bad{background:var(--t-bad)}.cells i.hold{background:var(--t-warn)}
+.key{display:flex;flex-wrap:wrap;gap:4px 14px;font:12px/1.4 'IBM Plex Mono',monospace;color:var(--soft);padding:8px 0 10px}
+.key span::before{content:"";display:inline-block;width:9px;height:9px;margin-right:6px;background:var(--t-ok);vertical-align:-1px}
+.key span.bad::before{background:var(--t-bad)}.key span.hold::before{background:var(--t-warn)}
 </style>
 </head>
 <body>
-<div class="wrap">
-  <header class="top">
-    <span class="brand">&gt; <i>gate</i></span>
-    <nav aria-label="Links"><a href="#run">The run</a><a href="#numbers">Numbers</a><a href="https://github.com/juw12/gate">GitHub</a></nav>
-  </header>
+<a class="skip" href="#main">Skip to content</a>
+<div class="sheet">
+<header class="mast">
+  <span class="name">gate</span>
+  <nav aria-label="Sections"><a href="#run">The run</a><a href="#audit">Audit</a><a href="#numbers">Numbers</a><a href="#install">Install</a><a href="https://github.com/juw12/gate">GitHub</a></nav>
+</header>
+<main id="main">
+<div class="hero">
+  <div>
+    <span class="ref">v0.5.0 &middot; MIT &middot; Python 3.11+</span>
+    <h1>A merge gate for AI&#8209;agent code.</h1>
+    <p class="lede">Many parallel agent sessions go in; a small number of tested, risk-tiered, provenance-tagged commits come out. Humans review only what policy says needs a human.</p>
+    <div class="actions"><a class="btn" href="#install">Install gate</a><a href="https://github.com/juw12/gate">Read the source on GitHub</a></div>
+  </div>
+  <div class="ledger" role="region" aria-label="Outcome of the recorded run">
+    <h2>Recorded run, 26 sessions</h2>
+    <ol><li><span class="n">26</span><span class="lead"></span><span class="l">agent sessions submitted</span></li><li><span class="n">19</span><span class="lead"></span><span class="l">merged, each tested</span></li><li><span class="n">3</span><span class="lead"></span><span class="l">broken by tests, rejected</span></li><li><span class="n">2</span><span class="lead"></span><span class="l">conflicts bounced</span></li><li><span class="n">1</span><span class="lead"></span><span class="l">secret blocked</span></li><li><span class="n">1</span><span class="lead"></span><span class="l">too large, sent back</span></li></ol>
+    <div class="strip"><div class="cap"><span>One block per session</span><span>in order</span></div><div class="cells" role="img" aria-label="26 sessions: 19 merged, 6 rejected, 1 sent back as too large"><i class="ok" title="race-x1: merged"></i><i class="ok" title="race-y1: merged"></i><i class="bad" title="race-x2: rejected, conflict"></i><i class="bad" title="race-y2: rejected, conflict"></i><i class="ok" title="feat-01: merged"></i><i class="ok" title="feat-02: merged"></i><i class="ok" title="feat-03: merged"></i><i class="ok" title="feat-04: merged"></i><i class="ok" title="feat-05: merged"></i><i class="ok" title="feat-06: merged"></i><i class="ok" title="feat-07: merged"></i><i class="ok" title="feat-08: merged"></i><i class="ok" title="feat-09: merged"></i><i class="ok" title="feat-10: merged"></i><i class="ok" title="feat-11: merged"></i><i class="ok" title="feat-12: merged"></i><i class="ok" title="feat-13: merged"></i><i class="ok" title="feat-14: merged"></i><i class="ok" title="feat-15: merged"></i><i class="ok" title="feat-16: merged"></i><i class="bad" title="broken-1: rejected, tests"></i><i class="bad" title="broken-2: rejected, tests"></i><i class="bad" title="broken-3: rejected, tests"></i><i class="ok" title="authz: merged"></i><i class="bad" title="leaky change: secret blocked"></i><i class="hold" title="900-line change: too large, sent back"></i></div><div class="key"><span>merged 19</span><span class="bad">rejected 6</span><span class="hold">too large 1</span></div></div><p class="stamp"><span>Broken code ever on main</span><b>None</b></p>
+  </div>
+</div>
 
-  <main>
-    <div class="hero">
-      <div>
-        <h1>A merge gate for <em>AI-agent</em> code.</h1>
-        <p class="lede">Many parallel agent sessions go in; a small number of tested, risk-tiered,
-          provenance-tagged commits come out. Humans review only what policy says needs a human.</p>
-        <p class="verdict">Broken code ever on main? <b>NO</b></p>
-        <ul class="tiles" aria-label="Outcome of the recorded run">
-        <li><b>26</b><span>agent sessions submitted</span></li>
-        <li><b>19</b><span>merged, each tested</span></li>
-        <li><b>3</b><span>broken by tests, rejected</span></li>
-        <li><b>2</b><span>conflicts bounced</span></li>
-        <li><b>1</b><span>secret blocked</span></li>
-        <li><b>1</b><span>too large, sent back</span></li>
-        </ul>
-      </div>
-      <div class="term" role="region" aria-label="gate runs, from the recorded demo">
-        <div class="bar"><i></i><i></i><i></i>&nbsp; python demo.py &middot; gate runs</div>
-        <pre tabindex="0"><span class="ok">merged</span>   race-x1                  b61d7c7d09  [lib]
-<span class="ok">merged</span>   race-y1                  b326305e47  [lib]
-<span class="bad">rejected</span> race-x2                  conflict: lib/shared_x.py
-<span class="bad">rejected</span> race-y2                  conflict: lib/shared_y.py
-<span class="ok">merged</span>   feat-01                  40876582a6  [default]
-<span class="ok">merged</span>   feat-02                  219971d87f  [default]
-<span class="ok">merged</span>   feat-03                  4c0fb0ae11  [default]
-<span class="ok">merged</span>   feat-04                  64e96af062  [default]
-<span class="ok">merged</span>   feat-05                  aa86b90cda  [default]
-<span class="ok">merged</span>   feat-06                  d04189dd1e  [default]
-<span class="ok">merged</span>   feat-07                  7db0d8504f  [default]
-<span class="ok">merged</span>   feat-08                  c537c60a7e  [default]
-<span class="ok">merged</span>   feat-09                  73ce976d6b  [default]
-<span class="ok">merged</span>   feat-10                  b6e5ab9e49  [default]
-<span class="ok">merged</span>   feat-11                  5bcc2b8363  [default]
-<span class="ok">merged</span>   feat-12                  188d48c64c  [default]
-<span class="ok">merged</span>   feat-13                  b865d623ce  [default]
-<span class="ok">merged</span>   feat-14                  ece7db7d27  [default]
-<span class="ok">merged</span>   feat-15                  f7642458c2  [default]
-<span class="ok">merged</span>   feat-16                  cb4a50800f  [default]
-<span class="bad">rejected</span> broken-1                 tests: FAILED (failures=1)
-<span class="bad">rejected</span> broken-2                 tests: FAILED (failures=1)
-<span class="bad">rejected</span> broken-3                 tests: FAILED (failures=1)
-
-authz: <span class="ok">approved</span> by juwen, <span class="mute">queued</span> at 22600b2011
-<span class="ok">merged</span>   authz                    33c9df7c9a  [default]
-
-dead-end: <span class="mute">abandoned</span>, diff archived to &lt;repo&gt;/.git/gate/attempts/dead-end.json.gz</pre>
-      </div>
-    </div>
-
-    <section id="run">
-      <h2>What happened in the run</h2>
-      <div class="grid2">
-        <ul class="plain">
-          <li>26 agent sessions submitted work: features, three deliberately broken changes, two pairs of
-            racing edits, one change to an auth path, a 900-line change and one leaking a token.</li>
-          <li>Every feature merged after its tests passed. The broken ones were rejected by the test suite, and the
-            losing side of each race was bounced as a conflict.</li>
-          <li>The auth change waited for a human (<code>gate approve</code>); the oversized change was sent back to
-            be split; the leaking change was blocked without echoing the secret.</li>
-          <li>A post-merge check found <code>main</code> green, and every landed commit carries provenance trailers
-            (session, model, tool, spec, risk tier, approver).</li>
-        </ul>
-        <div class="term" role="region" aria-label="stats from the recorded demo">
-          <div class="bar"><i></i><i></i><i></i>&nbsp; gate stats</div>
-          <pre tabindex="0">sessions by status:  <span class="mute">abandoned</span>=1, <span class="ok">merged</span>=19, <span class="bad">rejected</span>=6, <span class="warn">too_large</span>=1
-not-<span class="ok">merged</span> reasons:  conflict=2, secret=1, tests=3, <span class="warn">too_large</span>=1
-model model-alpha        <span class="ok">merged</span>   11 / 12   (92%)
-model model-beta         <span class="ok">merged</span>    8 / 14   (57%)
-CI runs: 10  (<span class="ok">merged</span> sessions per CI run: 1.90)
-suite runs: 9  suite cache hits: 1
-publishes: 6  commuted without re-test: 1  mean lock hold: 145 ms  (incl. wait: 146 ms)
-submit-&gt;merge median: 0.5 min
-live agent branches: 7   attempt archives: 491 B   traces: 151 B</pre>
-        </div>
-      </div>
-      <details>
-        <summary>Full transcript of <code>python demo.py</code></summary>
-        <div class="term" style="margin-top:12px"><pre tabindex="0">== 26 agent sessions submit ==
+<section id="run"><div class="sec"><span class="ref">01 / The run</span><div>
+  <h2>What happened in the recorded run</h2>
+  <ul class="points"><li>26 agent sessions submitted work: features, three deliberately broken changes, two pairs of racing edits, one change to an auth path, a 900-line change and one leaking a token.</li><li>Every feature merged after its tests passed. The broken ones were rejected by the test suite, and the losing side of each race was bounced as a conflict.</li><li>The auth change waited for a human (<code>gate approve</code>); the oversized change was sent back to be split; the leaking change was blocked without echoing the secret.</li><li>A post-merge check found <code>main</code> green, and every landed commit carries provenance trailers (session, model, tool, spec, risk tier, approver).</li></ul>
+  <div class="scroll"><table class="logtable"><thead><tr><th scope="col">Result</th><th scope="col">Session</th><th scope="col" class="hide-sm">Commit or reason</th></tr></thead><tbody><tr><td class="st-merged">merged</td><td>race-x1</td><td class="hide-sm">b61d7c7d09  [lib]</td></tr><tr><td class="st-merged">merged</td><td>race-y1</td><td class="hide-sm">b326305e47  [lib]</td></tr><tr><td class="st-rejected">rejected</td><td>race-x2</td><td class="hide-sm">conflict: lib/shared_x.py</td></tr><tr><td class="st-rejected">rejected</td><td>race-y2</td><td class="hide-sm">conflict: lib/shared_y.py</td></tr><tr><td class="st-merged">merged</td><td>feat-01</td><td class="hide-sm">40876582a6  [default]</td></tr><tr><td class="st-merged">merged</td><td>feat-02</td><td class="hide-sm">219971d87f  [default]</td></tr><tr><td class="st-merged">merged</td><td>feat-03</td><td class="hide-sm">4c0fb0ae11  [default]</td></tr><tr><td class="st-merged">merged</td><td>feat-04</td><td class="hide-sm">64e96af062  [default]</td></tr><tr><td class="st-merged">merged</td><td>feat-05</td><td class="hide-sm">aa86b90cda  [default]</td></tr><tr><td class="st-merged">merged</td><td>feat-06</td><td class="hide-sm">d04189dd1e  [default]</td></tr><tr><td class="st-merged">merged</td><td>feat-07</td><td class="hide-sm">7db0d8504f  [default]</td></tr><tr><td class="st-merged">merged</td><td>feat-08</td><td class="hide-sm">c537c60a7e  [default]</td></tr><tr><td class="st-merged">merged</td><td>feat-09</td><td class="hide-sm">73ce976d6b  [default]</td></tr><tr><td class="st-merged">merged</td><td>feat-10</td><td class="hide-sm">b6e5ab9e49  [default]</td></tr><tr><td class="st-merged">merged</td><td>feat-11</td><td class="hide-sm">5bcc2b8363  [default]</td></tr><tr><td class="st-merged">merged</td><td>feat-12</td><td class="hide-sm">188d48c64c  [default]</td></tr><tr><td class="st-merged">merged</td><td>feat-13</td><td class="hide-sm">b865d623ce  [default]</td></tr><tr><td class="st-merged">merged</td><td>feat-14</td><td class="hide-sm">ece7db7d27  [default]</td></tr><tr><td class="st-merged">merged</td><td>feat-15</td><td class="hide-sm">f7642458c2  [default]</td></tr><tr><td class="st-merged">merged</td><td>feat-16</td><td class="hide-sm">cb4a50800f  [default]</td></tr><tr><td class="st-rejected">rejected</td><td>broken-1</td><td class="hide-sm">tests: FAILED (failures=1)</td></tr><tr><td class="st-rejected">rejected</td><td>broken-2</td><td class="hide-sm">tests: FAILED (failures=1)</td></tr><tr><td class="st-rejected">rejected</td><td>broken-3</td><td class="hide-sm">tests: FAILED (failures=1)</td></tr><tr><td class="st-approved">approved</td><td>authz</td><td class="hide-sm">approved by juwen, queued at 22600b2011</td></tr><tr><td class="st-merged">merged</td><td>authz</td><td class="hide-sm">33c9df7c9a  [default]</td></tr><tr><td class="st-abandoned">abandoned</td><td>dead-end</td><td class="hide-sm">diff archived to &lt;repo&gt;/.git/gate/attempts/dead-end.json.gz</td></tr></tbody></table></div>
+  <details><summary class="">Full transcript of <code>python demo.py</code></summary><pre tabindex="0">== 26 agent sessions submit ==
 feat-01: <span class="mute">queued</span> (tier 1, lane default, 9 lines, 2 files)
 feat-02: <span class="mute">queued</span> (tier 1, lane default, 9 lines, 2 files)
 feat-03: <span class="mute">queued</span> (tier 1, lane default, 9 lines, 2 files)
@@ -276,60 +266,37 @@ Agent-Head: 22600b2011effe55052a77060ce19ffce37fd899
 
 == broken code ever on main? ==
 <span class="ok">NO</span>
-</pre></div>
-      </details>
-      <p class="mute-note">Recorded locally with gate v0.3.0; a re-run with v0.4.0 prints the same outcomes (only commit ids and
-        timings differ). Only a local file path was shortened to
-        <code>&lt;repo&gt;/</code>. 10 CI runs for 19 merges (1.90 merges per run),
-        mean publish-lock hold 145 ms.</p>
-    </section>
+</pre></details>
+  <p class="note" style="margin-top:16px">Recorded locally with gate v0.3.0; later versions print the same outcomes (only commit ids and timings differ). Only a local file path was shortened to <code>&lt;repo&gt;/</code>.</p>
+</div></div></section>
 
-    <section id="numbers">
-      <h2>Throughput, measured</h2>
-      <p>From <code>python bench.py --sessions 160 --lanes 8 --test-seconds 2 --batch 8</code> on one Windows laptop
-        (Git 2.55, Python 3.13), with a 2&nbsp;s sleep standing in for CI.</p>
-      <div class="scroll">
-        <table>
-          <thead><tr><th scope="col"><code>--parallel</code></th><th scope="col">wall</th><th scope="col">merges/day (extrapolated)</th><th scope="col">commuted publishes</th><th scope="col">publish-lock hold</th></tr></thead>
-          <tbody>
-            <tr><td>1</td><td>109.5 s</td><td>126k</td><td>0 / 24</td><td>87 ms</td></tr>
-            <tr><td>8</td><td>45.9 s</td><td>301k</td><td>22 / 24</td><td>1.4 s per 6.7 merges</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <p>Against github.com through a corporate HTTP proxy, each publish held the lock about 9&nbsp;s, a ceiling of
-        roughly 77k merges/day at batch 8. A weekly workflow re-runs batch, crash-recovery and push-race scenarios
-        against a real GitHub remote.</p>
-    </section>
+<section id="audit"><div class="sec"><span class="ref">02 / Audit</span><div>
+  <h2>Evidence an auditor can re-run</h2>
+  <p><code>gate audit</code> rebuilds a provenance report from the target's own history: every change that reached it, which model and tool made it, under which spec and risk tier, who approved it, every automatic revert, every attempt the gate refused, and every commit that reached the target <b>without</b> the gate.</p>
+  <pre tabindex="0">gate audit --since 2026-10-01 --until 2026-11-01 --out audit-2026-10.md
+gate --json audit                 <span class="mute"># same data as one JSON document</span>
+gate audit --strict               <span class="mute"># exit 2 on any finding</span></pre>
+  <p style="margin-top:16px">Anyone with the repository can re-run it and get the same table. Run <code>gate audit --strict</code> in CI to fail the build on a direct push or an unapproved high-risk change.</p>
+</div></div></section>
 
-    <section>
-      <div class="grid2">
-        <div>
-          <h2>Try it</h2>
-<div class="term"><pre tabindex="0">pip install git+https://github.com/juw12/gate
+<section id="numbers"><div class="sec"><span class="ref">03 / Throughput</span><div>
+  <h2>Throughput, measured</h2>
+  <p>From <code>python bench.py --sessions 160 --lanes 8 --test-seconds 2 --batch 8</code> on one Windows laptop (Git 2.55, Python 3.13), with a 2&nbsp;s sleep standing in for CI.</p>
+  <div class="scroll"><table class="bench"><thead><tr><th scope="col"><code>--parallel</code></th><th scope="col">wall</th><th scope="col">merges/day (extrapolated)</th><th scope="col">commuted publishes</th><th scope="col">publish-lock hold</th></tr></thead><tbody><tr><td>1</td><td>109.5 s</td><td>126k</td><td>0 / 24</td><td>87 ms</td></tr><tr><td>8</td><td>45.9 s</td><td>301k</td><td>22 / 24</td><td>1.4 s per 6.7 merges</td></tr></tbody></table></div>
+  <p class="note">Against github.com through a corporate HTTP proxy, each publish held the lock about 9&nbsp;s, a ceiling of roughly 77k merges/day at batch 8. A weekly workflow re-runs batch, crash-recovery and push-race scenarios against a real GitHub remote.</p>
+</div></div></section>
+
+<section id="install"><div class="sec"><span class="ref">04 / Install</span><div class="two">
+  <div><h3>Try it</h3><pre tabindex="0">pip install git+https://github.com/juw12/gate
 cd your-repo
 gate init        <span class="mute"># detects your test command</span>
 gate spawn fix-1234
 gate submit fix-1234 --model &lt;model-id&gt;
-gate queue --drain --parallel 8</pre></div>
-          <p>Standard library only. Python 3.11+, Git 2.40+. MIT licence.</p>
-        </div>
-        <div>
-          <h2>Still out of scope</h2>
-          <ul class="plain">
-            <li>Semantic conflicts are caught after the fact (<code>gate verify</code> bisects and reverts), not prevented.</li>
-            <li>Secret redaction is best-effort; plug in an external scanner for fail-closed coverage.</li>
-            <li>State is files, not a database. Sharing across hosts is tested by simulation, not on a real NFS cluster.</li>
-          </ul>
-        </div>
-      </div>
-    </section>
-  </main>
-
-  <footer>
-    <a href="https://github.com/juw12/gate">github.com/juw12/gate</a> &middot; <a href="https://github.com/juw12/gate/releases">releases</a> &middot;
-    numbers on this page come from the recorded demo and the README.
-  </footer>
+gate queue --drain --parallel 8</pre><p class="note" style="margin-top:12px">Standard library only. Python 3.11+, Git 2.40+. MIT licence.</p></div>
+  <div><h3>Still out of scope</h3><ul class="points"><li>Semantic conflicts are caught after the fact (<code>gate verify</code> bisects and reverts), not prevented.</li><li>Secret redaction is best-effort; plug in an external scanner for fail-closed coverage.</li><li>State is files, not a database. Sharing across hosts is tested by simulation, not on a real NFS cluster.</li></ul></div>
+</div></div></section>
+</main>
+<footer><span>61 tests on Linux, macOS and Windows. One file, <code>gate.py</code>, standard library only.</span><span><a href="https://github.com/juw12/gate">github.com/juw12/gate</a> &middot; <a href="https://github.com/juw12/gate/releases/tag/v0.5.0">release v0.5.0</a></span></footer>
 </div>
 </body>
 </html>
