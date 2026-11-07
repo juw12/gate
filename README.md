@@ -165,7 +165,7 @@ Unit/e2e: `python -m unittest -v test_gate`, 59 tests on real repos (real-proces
 locks, contended locks, protected remote, JSON interface, remote races, verify/revert, secrets, malformed
 policy, forged trailers, clean UTF-8 docs).
 CI runs them on Linux, macOS and Windows x Python 3.11/3.13 and also enforces `ruff`, `mypy` and ≥ 85 % line
-coverage of `gate.py`. The `nfs` workflow runs the two-host NFS test on every change to `gate.py`.
+coverage of `gate.py` (92 % at 0.4.0). The `nfs` workflow runs the two-host NFS test on every change to `gate.py`.
 
 Throughput, from `python bench.py --sessions 160 --lanes 8 --test-seconds 2 --batch 8` on one Windows laptop
 (Git 2.55, Python 3.13), with a 2 s sleep standing in for CI:
@@ -174,6 +174,11 @@ Throughput, from `python bench.py --sessions 160 --lanes 8 --test-seconds 2 --ba
 |---|---|---|---|---|---|
 | 1 | 109.5 s | 126 k | 0 / 24 | 87 ms | — |
 | 8 | 45.9 s | 301 k | 22 / 24 | 1.4 s per 6.7 merges | ≈ 408 k/day |
+
+A longer run with uneven test times (`bench.py --sessions 400 --lanes 8 --test-seconds 1 --test-seconds-max 5 --batch 8 --modes 8`,
+same laptop under heavy load): all 400 sessions merged in 369 s (≈ 94k merges/day extrapolated) using 56 test runs
+instead of 400; 55 of 56 publishes commuted past a concurrent lane without re-testing. The bench put the serialized
+step's ceiling at ≈ 99k/day for that run, so under load the publish step, not CI, was close to being the limit.
 
 The serialized publish step stops being the limit at about 400k merges/day on this hardware.
 Above that, throughput is set by CI capacity: about \(\text{lanes} \times \text{batch} / \text{test time}\).
