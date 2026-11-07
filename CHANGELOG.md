@@ -3,6 +3,19 @@
 All notable changes. Versions follow [semantic versioning](https://semver.org/); the JSON output and exit
 codes are part of the public interface.
 
+## [0.5.0] - 2026-11-07
+
+### Added
+- **`gate audit`**: a provenance report for a period (`--since`, `--until`), built from the target's first-parent
+  history and the gate's session records. It lists every change merged through the gate (model, tool, spec, risk
+  tier, approver, session), every automatic revert, every refused or unmerged attempt, and two kinds of finding:
+  a commit that reached the target without the gate, and a change at or above `approval_tier` merged without
+  `Approved-By`. `--out` writes the markdown report to a file, `--json` returns the same data, and `--strict`
+  exits 2 when there is any finding, so CI can fail on a bypass.
+- [`docs/provenance.md`](docs/provenance.md): the trailer format, version 1, with what it does and does not prove.
+- [`SECURITY.md`](SECURITY.md): how to report a vulnerability, and short answers to the usual security
+  questionnaire, each pointing at the code or test that backs it.
+
 ## [0.4.0] - 2026-11-07
 
 Every finding of the round-2 review was checked in the code first; all were real and are fixed here.

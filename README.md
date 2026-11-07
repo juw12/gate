@@ -122,6 +122,25 @@ python examples/agent_loop.py --repo . --session fix-1 --model my-model \
 | `3` | `verify`: target is red and needs a human (no green baseline, culprit not from gate or a merge commit, revert conflicts, revert still red, or `--no-revert`) |
 | `4` | `verify`: target moved while publishing the revert; run `verify` again |
 
+## Audit evidence
+
+`gate audit` turns the target's own history into a provenance report: every change that reached the target, which
+model and tool made it, under which spec and risk tier, who approved it, every automatic revert, every attempt the
+gate refused, and every commit that reached the target **without** the gate.
+
+```bash
+gate audit --since 2026-10-01 --until 2026-11-01 --out audit-2026-10.md   # markdown report for a reviewer
+gate --json audit                                                          # same data as one JSON document
+gate audit --strict                                                        # exit 2 if there is any finding
+```
+
+Findings are: a commit on the first-parent history of the target that the gate did not make (a direct push or
+a merge around the gate), and a change at or above `approval_tier` merged without `Approved-By`. Run
+`gate audit --strict` in CI to fail a build when either happens. The report is rebuilt from commits plus the
+local session records, so anyone with the repository can re-run it and get the same table. The trailer format
+is specified in [`docs/provenance.md`](docs/provenance.md); what the evidence does and does not prove is in
+[`SECURITY.md`](SECURITY.md).
+
 ## Crash safety
 
 Any gate process can be killed at any point without losing or duplicating work. The tests kill the real process
@@ -161,7 +180,7 @@ that is checked out in any worktree, whether in `queue`, a remote fetch or a `ve
 
 ## Measured
 
-Unit/e2e: `python -m unittest -v test_gate`, 60 tests on real repos (real-process kills, skewed and silent
+Unit/e2e: `python -m unittest -v test_gate`, 61 tests on real repos (real-process kills, skewed and silent
 locks, contended locks, protected remote, JSON interface, remote races, verify/revert, secrets, malformed or
 misspelled policy, forged trailers, clean UTF-8 docs).
 CI runs them on Linux, macOS and Windows x Python 3.11/3.13 and also enforces `ruff`, `mypy` and ≥ 85 % line

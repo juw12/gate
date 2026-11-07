@@ -1139,6 +1139,40 @@ class GateTest(unittest.TestCase):
         self.assertIn("merge commit", doc["result"]["reason"])
         self.assertEqual(run_git("rev-parse", "main", cwd=self.repo).strip(), merge, "main untouched")
 
+    def test_audit_reports_provenance_bypasses_and_refusals(self):
+        self.make_repo()
+        self.assertEqual(self.agent("a1", self.feature(1), model="model-a")[0], 0)
+        self.assertEqual(self.agent("b1", self.feature(2), model="model-b")[0], 0)
+        worktree = self.spawn("risky")
+        self.commit(worktree, {"auth/policy.py": "ALLOW_ALL = False  # reviewed\n"}, "risky: tighten auth")
+        self.gate("submit", "risky", "--model", "model-a")
+        self.gate("approve", "risky", "--by", "alice")
+        worktree = self.spawn("leaky")
+        self.commit(worktree, {"lib/config.py": (
+            'DB_PASSWORD = "hunter2hunter2"\n'
+            'AWS_KEY = "AKIAABCDEFGHIJKLMNOP"\n'
+        )}, "leaky: add keys")
+        self.gate("submit", "leaky", "--model", "model-b")
+        self.assertEqual(self.gate("queue", "--drain")[0], 0)
+        self.commit_on_main({"docs/hotfix.md": "x\n"}, "hotfix pushed around the gate")
+
+        out_file = self.tmp / "audit.md"
+        code, out = self.gate("--json", "audit", "--out", str(out_file))
+        self.assertEqual(code, 0, out)
+        result = json.loads(out)["result"]
+        self.assertEqual(result["counts"]["gate"], 3)
+        self.assertEqual(result["by_model"], {"model-a": 2, "model-b": 1})
+        risky = next(c for c in result["commits"] if c["trailers"].get("Agent-Session") == "risky")
+        self.assertEqual(risky["trailers"]["Approved-By"], "alice")
+        self.assertEqual([r["session"] for r in result["refused"]], ["leaky"])
+        self.assertTrue(any("hotfix pushed around the gate" in f for f in result["findings"]))
+        report = out_file.read_text(encoding="utf-8")
+        self.assertIn("| risky |", report.replace("| alice | risky |", "| risky |"))
+        self.assertIn("without the gate", report)
+
+        code, _ = self.gate("audit", "--strict")
+        self.assertEqual(code, gate.EXIT_POLICY)
+
     # ------------------------------------------------------------ ergonomics
     def test_json_flag_works_after_the_subcommand(self):
         self.make_repo()
