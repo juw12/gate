@@ -1,8 +1,9 @@
 """Two hosts, one repository on a real NFS export, one clock skewed: do gate's locks and queue hold up?
 
-Host A and host B are docker containers with different hostnames. Each sees the export through its own
-NFS client mount (`nosharecache`, so each has its own attribute cache, as two machines would). Host B's
-clock runs SKEW_S ahead of A's (libfaketime). The checks:
+Host A and host B are privileged docker containers with different hostnames, each in its own network
+namespace and each mounting the export itself, so the server sees two separate NFSv4 clients (own client
+id, own attribute cache, own delegations), as it would see two machines. Host B's clock runs SKEW_S ahead
+of A's (libfaketime). The checks:
 
 1. live lock:  A holds a lock and keeps heartbeating. B tries to take it for longer than LOCK_STALE_S and
                must fail, although by B's clock the lock file looks SKEW_S old (a timestamp-comparison
@@ -11,7 +12,7 @@ clock runs SKEW_S ahead of A's (libfaketime). The checks:
 3. queue:      `gate queue --drain` runs on A and B at the same time over shared lanes; every session lands
                exactly once.
 
-Needs Linux, docker, and the export mounted twice at /mnt/host-a and /mnt/host-b
+Needs Linux, docker, and an NFS server exporting NFS_EXPORT to the docker bridge network
 (see .github/workflows/nfs.yml). Writes a Markdown summary to $GITHUB_STEP_SUMMARY when set.
 """
 from __future__ import annotations
@@ -31,14 +32,14 @@ SKEW_S = 120
 SESSIONS = 8
 SRC = Path(__file__).resolve().parent
 FAKETIME_LIB = "/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1"
+NFS_EXPORT = os.environ.get("NFS_EXPORT", "172.17.0.1:/srv/nfs/shared")
 HOSTS = {
-    "host-a": {"mount": "/mnt/host-a", "env": {}},
-    "host-b": {"mount": "/mnt/host-b", "env": {"LD_PRELOAD": FAKETIME_LIB, "FAKETIME": f"+{SKEW_S}s",
-                                              "NO_FAKE_STAT": "1"}},
+    "host-a": {},
+    "host-b": {"LD_PRELOAD": FAKETIME_LIB, "FAKETIME": f"+{SKEW_S}s", "NO_FAKE_STAT": "1"},
 }
 DOCKERFILE = """\
 FROM python:3.12-slim
-RUN apt-get update -q && apt-get install -y -q --no-install-recommends git faketime procps \\
+RUN apt-get update -q && apt-get install -y -q --no-install-recommends git faketime procps nfs-common \\
  && rm -rf /var/lib/apt/lists/*
 RUN git config --global user.name gate-nfs && git config --global user.email nfs@example.com \\
  && git config --global init.defaultBranch main && git config --global --add safe.directory '*'
@@ -85,11 +86,23 @@ def on(host: str, script: str, check: bool = True, timeout: float = 600) -> subp
 
 
 def start(host: str) -> None:
-    spec = HOSTS[host]
-    env = {"GATE_LOCK_STALE_S": str(LOCK_STALE_S), **spec["env"]}
+    env = {"GATE_LOCK_STALE_S": str(LOCK_STALE_S), **HOSTS[host]}
     flags = [arg for key, value in env.items() for arg in ("-e", f"{key}={value}")]
-    run("docker", "run", "-d", "--name", host, "--hostname", host, "-v", f"{spec['mount']}:/work",
-        "-v", f"{SRC}:/src:ro", *flags, IMAGE, "sleep", "infinity")
+    # The container mounts the export itself (its own NFS client) and only then idles. LD_PRELOAD is
+    # cleared for mount so the faked clock cannot interfere with it.
+    boot = f"mkdir -p /work && env -u LD_PRELOAD mount -t nfs -o vers=4.2 {NFS_EXPORT} /work && exec sleep infinity"
+    run("docker", "run", "-d", "--privileged", "--name", host, "--hostname", host,
+        "-v", f"{SRC}:/src:ro", *flags, IMAGE, "bash", "-c", boot)
+    wait_for_mount(host)
+
+
+def wait_for_mount(host: str) -> None:
+    deadline = time.monotonic() + 60
+    while on(host, "mountpoint -q /work", check=False).returncode != 0:
+        if time.monotonic() > deadline:
+            logs = run("docker", "logs", host, check=False)
+            raise SystemExit(f"{host} could not mount {NFS_EXPORT}:\n{logs.stdout}{logs.stderr}")
+        time.sleep(0.5)
 
 
 def check(condition: bool, message: str) -> None:
@@ -134,7 +147,17 @@ def lock_checks(results: dict) -> None:
     while on("host-b", "test -e /work/repo/.git/gate/probe.lock", check=False).returncode != 0:
         check(time.monotonic() < deadline, "host A acquired the probe lock")
         time.sleep(0.5)
-    time.sleep(6)  # at least one heartbeat
+    watch = on("host-b", "python - <<'EOF'\n"
+                         "import os, time\n"
+                         "seen = []\n"
+                         "for _ in range(12):\n"
+                         "    with open('/work/repo/.git/gate/probe.lock', 'rb') as handle:\n"
+                         "        seen.append(os.fstat(handle.fileno()).st_mtime_ns)\n"
+                         "    time.sleep(1)\n"
+                         "print(len(set(seen)))\n"
+                         "EOF").stdout.strip()
+    results["heartbeats_seen_by_b_in_12s"] = int(watch)
+    check(int(watch) >= 2, f"host B sees host A's heartbeats ({watch} distinct mtimes in 12 s)")
     timeout = LOCK_STALE_S * 2.5
     live = json.loads(on("host-b", f"python /work/scripts/contend.py {timeout}").stdout)
     results["live"] = live
@@ -150,6 +173,7 @@ def lock_checks(results: dict) -> None:
     check(LOCK_STALE_S - 1 <= dead["elapsed"] <= LOCK_STALE_S * 3,
           f"takeover waited for about LOCK_STALE_S ({LOCK_STALE_S} s) of silence")
     run("docker", "start", "host-a")
+    wait_for_mount("host-a")
 
 
 def queue_check(results: dict) -> None:
@@ -190,9 +214,6 @@ def queue_check(results: dict) -> None:
 
 
 def main() -> int:
-    for spec in HOSTS.values():
-        if not os.path.ismount(spec["mount"]):
-            raise SystemExit(f"{spec['mount']} is not mounted; see .github/workflows/nfs.yml")
     with tempfile.TemporaryDirectory() as context:
         Path(context, "Dockerfile").write_text(DOCKERFILE)
         run("docker", "build", "-q", "-t", IMAGE, context)
