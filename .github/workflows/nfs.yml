@@ -1,0 +1,33 @@
+name: nfs
+
+# Two docker "hosts", each its own NFS client, share one repository over a real NFS export;
+# one host's clock runs 120 s ahead. See nfs_e2e.py.
+on:
+  push:
+    branches: [main]
+    paths: ["gate.py", "nfs_e2e.py", ".github/workflows/nfs.yml"]
+  pull_request:
+    paths: ["gate.py", "nfs_e2e.py", ".github/workflows/nfs.yml"]
+  workflow_dispatch:
+
+jobs:
+  nfs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: NFS server, exported to the docker bridge network
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q nfs-kernel-server
+          sudo mkdir -p /srv/nfs/shared
+          sudo chmod 777 /srv/nfs/shared
+          echo "/srv/nfs/shared 172.17.0.0/16(rw,sync,no_subtree_check,no_root_squash,insecure)" | sudo tee /etc/exports
+          sudo exportfs -ra
+          sudo systemctl restart nfs-kernel-server
+          sudo exportfs -v
+          ip -4 addr show docker0
+
+      - name: Locks and queue across hosts
+        run: python nfs_e2e.py

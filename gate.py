@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import contextlib
+import difflib
 import fnmatch
 import gzip
 import hashlib
@@ -32,6 +33,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import socket
 import statistics
 import subprocess
@@ -45,11 +47,14 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 CONFIG_FILE = "gate.toml"
 LOCK_HEARTBEAT_S = 5.0   # a lock holder touches its lock file this often
-LOCK_STALE_S = 60.0      # a lock untouched this long is abandoned (owner dead, frozen or gone)
+LOCK_STALE_S = float(os.environ.get("GATE_LOCK_STALE_S", "60"))  # silent this long = abandoned
+BREAK_STALE_S = 10.0     # a stale-lock breaker that stays put this long died mid-break
+SCAN_TIMEOUT_S = 300.0   # external secret scanner time limit; a timeout counts as a finding
+LEASE_REJECTED = re.compile(r"stale info|fetch first|non-fast-forward|cannot lock ref|but expected", re.I)
 MIN_GIT = (2, 40)
 SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 IN_FLIGHT = {"active", "too_large", "needs_approval", "queued", "rejected"}
@@ -286,6 +291,24 @@ class Output:
 OUT = Output()
 
 
+def fault_point(name: str) -> None:
+    """Test hook: with GATE_FAULT=<name>, kill this process abruptly here (no cleanup, no finally blocks,
+    locks left behind), the way a crash, OOM kill or power loss would."""
+    if os.environ.get("GATE_FAULT") == name:
+        sys.stdout.flush()
+        os.kill(os.getpid(), getattr(signal, "SIGKILL", signal.SIGTERM))
+
+
+def write_atomic(path: Path, data: bytes) -> None:
+    """Write via a temp file + rename, so readers and crash recovery never see a partial file."""
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def pid_alive(pid: int) -> bool:
     """True if a process with this id is running on this host."""
     if pid <= 0:
@@ -349,8 +372,90 @@ def git_version() -> tuple[int, int]:
     return (int(numbers.group(1)), int(numbers.group(2))) if numbers else (0, 0)
 
 
+CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def one_line(value: Any) -> str:
+    """Collapse any whitespace or control characters so a value stays on one commit-message line."""
+    return " ".join(CONTROL_CHARS.sub(" ", str(value)).split())
+
+
 def matches(path: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)
+
+
+def _type_name(expected: type | tuple[type, ...]) -> str:
+    names = {str: "a string", int: "an integer", float: "a number", bool: "true or false",
+             list: "a list", dict: "a table"}
+    kinds = expected if isinstance(expected, tuple) else (expected,)
+    return " or ".join(names[kind] for kind in kinds)
+
+
+def _is(value: Any, expected: type | tuple[type, ...]) -> bool:
+    kinds = expected if isinstance(expected, tuple) else (expected,)
+    if isinstance(value, bool) and bool not in kinds:
+        return False  # TOML true/false is not a number
+    return isinstance(value, kinds)
+
+
+def _string_list_problem(name: str, value: Any) -> str | None:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return f"{name} must be a list of strings"
+    return None
+
+
+def config_problem(config: dict) -> str | None:
+    """First thing wrong with a merged config, phrased for the human who has to fix it; None if valid."""
+    # Unknown keys are refused: a typo such as `test_comand` would otherwise leave the default (no tests) in force.
+    for key in config:
+        if key not in DEFAULT_CONFIG:
+            close = difflib.get_close_matches(key, DEFAULT_CONFIG, n=1)
+            return f"unknown key {key!r}" + (f" (did you mean {close[0]!r}?)" if close else "")
+    for table in ("risk", "retention"):
+        if isinstance(config[table], dict):
+            for key in config[table]:
+                if key not in DEFAULT_CONFIG[table]:  # type: ignore[operator]
+                    return f"unknown key {table}.{key}"
+    for key, default in DEFAULT_CONFIG.items():
+        expected: type | tuple[type, ...] = (int, float) if isinstance(default, (int, float)) and not \
+            isinstance(default, bool) else type(default)
+        if not _is(config[key], expected):
+            return f"{key} must be {_type_name(expected)}, not {config[key]!r}"
+    for key in ("size_exempt", "secret_scan_exempt"):
+        problem = _string_list_problem(key, config[key])
+        if problem:
+            return problem
+    for key in ("high", "low"):
+        problem = _string_list_problem(f"risk.{key}", config["risk"].get(key, []))
+        if problem:
+            return problem
+    for lane, patterns in config["lanes"].items():
+        problem = _string_list_problem(f"lanes.{lane}", patterns)
+        if problem:
+            return problem
+    for key, value in config["retention"].items():
+        if not _is(value, (int, float)):
+            return f"retention.{key} must be a number, not {value!r}"
+    names = ["default"] if config["test_command"] else []
+    for index, suite in enumerate(config["tests"]):
+        names.append(suite.get("name") or f"suite{index}" if isinstance(suite, dict) else f"suite{index}")
+    repeated = sorted({name for name in names if names.count(name) > 1})
+    if repeated:
+        # Suite names key the pass cache; a shared name would let one suite's pass skip the other.
+        return f"test suite name {repeated[0]!r} is used more than once (test_command is named 'default')"
+    for index, suite in enumerate(config["tests"]):
+        where = f"[[tests]] entry {index + 1}" + (f" ({suite.get('name')})" if isinstance(suite, dict)
+                                                  and suite.get("name") else "")
+        if not isinstance(suite, dict):
+            return f"{where} must be a table"
+        if not isinstance(suite.get("command"), str) or not suite["command"].strip():
+            return f"{where} needs a command = '...' to run"
+        if "name" in suite and not isinstance(suite["name"], str):
+            return f"{where}: name must be a string"
+        problem = _string_list_problem(f"{where}: paths", suite.get("paths", []))
+        if problem:
+            return problem
+    return None
 
 
 def merged_config(overrides: dict) -> dict:
@@ -377,13 +482,25 @@ class Gate:
         configured = git_run("config", "gate.target", cwd=self.root).stdout.strip()
         self.target = configured or "main"
         self.config = self._load_config()
+        # Lock liveness is judged by observed change on this process's own clock (see _unchanged_for).
+        self._observed: dict[str, tuple[tuple[str, int], float]] = {}
+        self._observed_lock = threading.Lock()
 
     # ---------------------------------------------------------------- config / state
     def _load_config(self) -> dict:
         proc = git_run("show", f"refs/heads/{self.target}:{CONFIG_FILE}", cwd=self.root)
         if proc.returncode != 0:
             return merged_config({})
-        return merged_config(tomllib.loads(proc.stdout))
+        source = f"{CONFIG_FILE} on {self.target}"
+        fix = f"fix it with a normal commit to {self.target}"
+        try:
+            overrides = tomllib.loads(proc.stdout)
+        except tomllib.TOMLDecodeError as error:
+            raise GateError(f"{source} is not valid TOML ({error}); {fix}") from None
+        problem = config_problem(merged_config(overrides))
+        if problem:
+            raise GateError(f"{source}: {problem}; {fix}")
+        return merged_config(overrides)
 
     def session_path(self, sid: str) -> Path:
         return self.state / "sessions" / f"{sid}.json"
@@ -398,9 +515,7 @@ class Gate:
         self.write_json(self.session_path(session["id"]), session)
 
     def write_json(self, path: Path, data: Any) -> None:
-        tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
-        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
+        write_atomic(path, json.dumps(data, indent=2).encode("utf-8"))
 
     def read_json(self, name: str, default: Any) -> Any:
         path = self.state / name
@@ -422,12 +537,17 @@ class Gate:
     @contextlib.contextmanager
     def lock(self, name: str, timeout_s: float = 30.0) -> Iterator[None]:
         """Exclusive lock file recording `pid host token`. While it is held, a heartbeat thread touches
-        it every LOCK_HEARTBEAT_S. Another process may break it only if the owner is a dead process on
-        this host, or if it has not been touched for LOCK_STALE_S (owner crashed, frozen, its pid was
-        reused, or it runs on another host sharing the repository over a network filesystem)."""
+        it every LOCK_HEARTBEAT_S. Another process may break it only if
+        - the owner is a dead process on this host, or
+        - this process has watched the lock file stay unchanged for LOCK_STALE_S on its own monotonic
+          clock (owner crashed, frozen, its pid was reused, or it ran on another host), or
+        - its timestamp is older than 10 x LOCK_STALE_S (abandoned long ago).
+        Liveness is judged by change, not by comparing timestamps with this host's clock, so clock skew
+        between hosts and NFS attribute caching cannot make a live lock look stale."""
         path = self.state / f"{name}.lock"
         token = f"{os.getpid()} {socket.gethostname()} {uuid.uuid4().hex}"
-        deadline = time.time() + timeout_s
+        deadline = time.monotonic() + timeout_s
+        waiting_since = time.monotonic()
         while True:
             try:
                 fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -438,11 +558,12 @@ class Gate:
                 if self._lock_is_stale(path):
                     self._break_stale_lock(path)
                     continue
-                if time.time() > deadline:
+                if time.monotonic() > deadline and not self._silent_since(path, waiting_since):
                     raise GateError(f"{name} lock is held by another gate process ({path}); it is taken "
                                     f"over automatically once that process exits or stops refreshing it "
                                     f"for {LOCK_STALE_S:.0f} s") from None
                 time.sleep(0.05)
+        self._forget(path)
         stop = threading.Event()
         heartbeat = threading.Thread(target=self._heartbeat, args=(path, token, stop), daemon=True)
         heartbeat.start()
@@ -479,6 +600,40 @@ class Gate:
                 time.sleep(0.01 * min(attempt + 1, 10))
         raise GateError(f"could not release lock {path}")
 
+    @staticmethod
+    def _read_lock(path: Path) -> tuple[str, float] | None:
+        """Content and mtime. open() + fstat() rather than stat(): on NFS, open revalidates cached
+        attributes (close-to-open consistency), so a heartbeat from another host is seen."""
+        try:
+            with open(path, "rb") as handle:
+                content = handle.read().decode("utf-8", "replace")
+                return content, os.fstat(handle.fileno()).st_mtime
+        except OSError:
+            return None
+
+    def _unchanged_for(self, path: Path, content: str, mtime: float) -> float:
+        """Seconds (on this process's monotonic clock) for which this file has shown the same content
+        and mtime. Any change - a heartbeat, a new owner - restarts the count."""
+        signature = (content, int(mtime * 1e9))
+        now = time.monotonic()
+        with self._observed_lock:
+            seen = self._observed.get(str(path))
+            if seen is None or seen[0] != signature:
+                self._observed[str(path)] = (signature, now)
+                return 0.0
+            return now - seen[1]
+
+    def _silent_since(self, path: Path, since: float) -> bool:
+        """True if the lock has not changed since `since`: its owner may be dead, so keep waiting until
+        the observation window decides, even past the caller's timeout."""
+        with self._observed_lock:
+            seen = self._observed.get(str(path))
+        return seen is not None and seen[1] <= since + LOCK_HEARTBEAT_S / 2
+
+    def _forget(self, path: Path) -> None:
+        with self._observed_lock:
+            self._observed.pop(str(path), None)
+
     def _break_stale_lock(self, path: Path) -> None:
         """Remove a stale lock without racing other breakers: only the holder of `<lock>.break` may
         delete it, after re-checking. A live owner never loses its lock, because a fresh lock file can
@@ -487,38 +642,61 @@ class Gate:
         try:
             fd = os.open(breaker, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except (FileExistsError, PermissionError):
-            with contextlib.suppress(OSError):
-                if time.time() - breaker.stat().st_mtime > 10:  # a breaker that died mid-break
-                    breaker.unlink()
+            # stat(), not open(): on Windows an open handle would stop the breaker's owner deleting it.
+            try:
+                info = os.stat(breaker)
+            except OSError:
+                info = None
+            if info and self._unchanged_for(breaker, str(info.st_size), info.st_mtime) > BREAK_STALE_S:
+                self._unlink_retrying(breaker)  # a breaker that died mid-break
+                self._forget(breaker)
             time.sleep(0.01)
             return
         try:
             os.close(fd)
             if self._lock_is_stale(path):
-                with contextlib.suppress(FileNotFoundError, PermissionError):
-                    path.unlink()
+                self._unlink_retrying(path)
+                self._forget(path)
         finally:
-            with contextlib.suppress(OSError):
-                breaker.unlink()
+            self._unlink_retrying(breaker)
 
     @staticmethod
-    def _lock_is_stale(path: Path) -> bool:
-        try:
-            owner = path.read_text(encoding="utf-8").split()
-            age = time.time() - path.stat().st_mtime
-        except OSError:
-            return False
-        if age > LOCK_STALE_S:
-            return True
-        if len(owner) >= 2 and owner[1] == socket.gethostname() and owner[0].isdigit():
-            return not pid_alive(int(owner[0]))
-        return False
+    def _unlink_retrying(path: Path) -> None:
+        """Delete a file, retrying briefly while another process holds it open (Windows refuses then)."""
+        for attempt in range(50):
+            try:
+                path.unlink()
+                return
+            except FileNotFoundError:
+                return
+            except PermissionError:
+                time.sleep(0.005 * min(attempt + 1, 10))
 
-    def update(self, sid: str, expected_head: str | None = None, **changes: Any) -> bool:
-        """Read-modify-write a session; skip if it was resubmitted with a new head."""
+    def _lock_is_stale(self, path: Path) -> bool:
+        observed = self._read_lock(path)
+        if observed is None:
+            return False
+        content, mtime = observed
+        owner = content.split()
+        same_host = len(owner) >= 2 and owner[1] == socket.gethostname() and owner[0].isdigit()
+        if same_host and not pid_alive(int(owner[0])):
+            return True
+        age = time.time() - mtime
+        if same_host and age > LOCK_STALE_S:
+            return True  # same clock, so the timestamp can be trusted (frozen holder or reused pid)
+        if age > 10 * LOCK_STALE_S:
+            return True  # abandoned long ago; tolerates up to 9 x LOCK_STALE_S of clock skew
+        return self._unchanged_for(path, content, mtime) > LOCK_STALE_S
+
+    def update(self, sid: str, expected_head: str | None = None, expected_status: str | None = None,
+               **changes: Any) -> bool:
+        """Read-modify-write a session under the state lock; skip (return False) if it was resubmitted
+        with a new head or has moved on from the status the caller saw."""
         with self.lock("state"):
             session = self.load(sid)
             if expected_head is not None and session.get("head") != expected_head:
+                return False
+            if expected_status is not None and session.get("status") != expected_status:
                 return False
             session.update(changes)
             self.save(session)
@@ -543,25 +721,44 @@ class Gate:
         git("fetch", "--quiet", remote, f"+refs/heads/{self.target}:{tracking}", cwd=self.root)
         tip = self.rev(tracking)
         previous = git_run("rev-parse", "--verify", "--quiet", f"refs/heads/{self.target}", cwd=self.root)
+        if previous.stdout.strip() != tip:
+            self.ensure_target_free()
         git("update-ref", f"refs/heads/{self.target}", tip, cwd=self.root)
         if previous.stdout.strip() != tip:
             self.config = self._load_config()  # the policy lives on the target; it may have just changed
         return tip
 
     def advance(self, old: str, new: str) -> None:
-        """Compare-and-swap the target from old to new."""
+        """Compare-and-swap the target from old to new. Contention means the target moved (rebuild and
+        retry); any other refusal - a protected branch, missing permission, a network or auth error - is
+        an error a retry cannot fix, so it is reported at once instead of re-testing the batch."""
+        self.ensure_target_free()
         remote = self.config["remote"]
         ref = f"refs/heads/{self.target}"
         if remote:
-            proc = git_run("push", "--quiet", remote, f"{new}:{ref}",
+            proc = git_run("push", "--quiet", "--porcelain", remote, f"{new}:{ref}",
                            f"--force-with-lease={ref}:{old}", cwd=self.root)
             if proc.returncode != 0:
-                raise Contention(proc.stderr.strip())
+                output = (proc.stdout + proc.stderr).strip()
+                if LEASE_REJECTED.search(output):
+                    raise Contention(output)
+                raise GateError(f"remote '{remote}' rejected the push to {self.target}: {output[-400:]}\n"
+                                f"Nothing was lost: the sessions stay queued. If the branch is protected, give "
+                                f"the gate's account a bypass (README: Publishing to GitHub); if this is a "
+                                f"network or authentication error, fix it and run the queue again.")
             git("update-ref", ref, new, cwd=self.root)
             return
         proc = git_run("update-ref", ref, new, old, cwd=self.root)
         if proc.returncode != 0:
             raise Contention(proc.stderr.strip())
+
+    def ensure_target_free(self) -> None:
+        """Moving a branch that a worktree has checked out would leave that checkout looking as if it
+        had reverted every new commit, so refuse."""
+        if self.target_checked_out():
+            raise GateError(f"'{self.target}' is checked out in a worktree, and gate would move it under that "
+                            f"checkout; run gate from a detached HEAD or another branch (`gate doctor --fix` "
+                            f"detaches the main checkout)")
 
     def target_checked_out(self) -> bool:
         listing = git("worktree", "list", "--porcelain", cwd=self.root)
@@ -602,8 +799,13 @@ class Gate:
         try:
             target = scratch / "content.txt"
             target.write_text(text, encoding="utf-8")
-            proc = subprocess.run(command.replace("{file}", str(target)), shell=True,
-                                  capture_output=True, text=True, errors="replace", timeout=300)
+            try:
+                proc = subprocess.run(command.replace("{file}", str(target)), shell=True,
+                                      capture_output=True, text=True, errors="replace", timeout=SCAN_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                return f"external scanner timed out after {SCAN_TIMEOUT_S:.0f} s; treated as a finding (fail closed)"
+            except OSError as error:
+                return f"external scanner could not run ({error}); treated as a finding (fail closed)"
             if proc.returncode == 0:
                 return None
             return (proc.stdout + proc.stderr).strip()[-500:] or "external scanner reported findings"
@@ -695,8 +897,9 @@ class Gate:
             ("Agent-Base", session["base"]),
             ("Agent-Head", session["head"]),
         ]
-        body = "\n".join(f"{key}: {value}" for key, value in trailers if value)
-        message = f"{session['title']}\n\n{body}\n"
+        # Flatten every agent-supplied value: a newline would let it forge trailers such as Agent-Head.
+        body = "\n".join(f"{key}: {one_line(value)}" for key, value in trailers if value)
+        message = f"{one_line(session['title'])}\n\n{body}\n"
         return git("commit-tree", tree, "-p", parent, "-m", message, cwd=self.root,
                    env=self.commit_env(session["head"])).strip()
 
@@ -772,8 +975,7 @@ class Gate:
         patch, _ = redact(patch)
         path = self.state / "attempts" / f"{session['id']}.json.gz"
         record = {"session": session, "head": head, "patch": patch}
-        with gzip.open(path, "wt", encoding="utf-8") as handle:
-            json.dump(record, handle)
+        write_atomic(path, gzip.compress(json.dumps(record).encode("utf-8")))
         return path
 
     # ---------------------------------------------------------------- landing
@@ -799,7 +1001,7 @@ class Gate:
                         continue
                     candidate = self.squash_commit(session, tree, candidate)
                     landed.append((session, candidate))
-                elif proc.returncode == 1:
+                elif proc.returncode == 1 and proc.stdout.strip():  # a tree id first, then conflicted paths
                     conflicted = sorted({line for line in proc.stdout.splitlines()[1:] if line})
                     if candidate != tip and git_run("merge-tree", "--write-tree", tip,
                                                     session["head"], cwd=self.root).returncode == 0:
@@ -807,16 +1009,18 @@ class Gate:
                     else:
                         self.reject(session, "conflict", ", ".join(conflicted))
                 else:
-                    raise GateError(f"merge-tree failed: {proc.stderr.strip()}")
+                    raise GateError(f"merge-tree failed for session {session['id']}: {proc.stderr.strip()}")
             if not landed:
                 return deferred
 
             files = self.changed_files(tip, candidate)
             ok, log = self.run_tests(candidate, files)
             if ok:
+                fault_point("after-tests")
                 published = self.publish(tip, [commit for _, commit in landed], files)
                 if published is None:
                     continue  # overlapping change landed meanwhile: rebuild and re-test
+                fault_point("after-publish")
                 now = time.time()
                 for (session, _), commit in zip(landed, published, strict=True):
                     if self.update(session["id"], session["head"], status="merged",
@@ -835,6 +1039,30 @@ class Gate:
             deferred += self.land(sessions[middle:])
             return deferred
         raise GateError("target kept moving during publish; gave up after 5 attempts")
+
+    def reconcile_reverts(self, tip: str, since: str | None) -> list[str]:
+        """Crash recovery for verify: a revert published by a run that died before recording it carries
+        `Reverts:` and `Agent-Session:` trailers, so mark that session reverted now."""
+        if since and git_run("merge-base", "--is-ancestor", since, tip, cwd=self.root).returncode == 0:
+            span = [f"{since}..{tip}"]
+        else:
+            span = ["-n", "200", tip]
+        log = git("log", "--format=%H%x1f%(trailers:key=Reverts,valueonly,separator=%x2C)%x1f"
+                  "%(trailers:key=Agent-Session,valueonly,separator=%x2C)", *span, cwd=self.root)
+        recovered = []
+        for line in log.splitlines():
+            commit, reverts, sid = (line.split("\x1f") + ["", ""])[:3]
+            sid = sid.strip()
+            if not reverts.strip() or not sid or not self.session_path(sid).exists():
+                continue
+            if self.load(sid)["status"] == "reverted":
+                continue
+            if self.update(sid, status="reverted", reason="post-merge verification failed",
+                           reverted_by=commit, finished=time.time(), recovered=True):
+                recovered.append(sid)
+                OUT.event("recovered", f"recovered revert of {sid} ({commit[:10]}, published by an interrupted "
+                          f"verify)", session=sid, commit=commit)
+        return recovered
 
     def reconcile(self, lane: str | None = None) -> list[str]:
         """Crash recovery. A process killed after publishing but before recording the result
@@ -972,6 +1200,11 @@ def cmd_submit(gate: Gate, args: argparse.Namespace) -> int:
     prompt_sha = None
     if args.prompt_file:
         prompt_sha = hashlib.sha256(Path(args.prompt_file).read_bytes()).hexdigest()
+    for flag in ("model", "tool", "spec", "title"):
+        value = getattr(args, flag)
+        if value and CONTROL_CHARS.search(value):
+            raise GateError(f"--{flag} must be a single line (no newlines or control characters); "
+                            "it is written into the commit message as provenance")
     title = args.title or git("log", "-1", "--format=%s", head, cwd=gate.root).strip()
 
     findings: list[str] = []
@@ -1071,7 +1304,8 @@ def cmd_verify(gate: Gate, args: argparse.Namespace) -> int:
         tip = gate.sync_tip()
         state = gate.read_json("verify.json", {})
         last_green = state.get("last_green")
-        OUT.result = {"target": gate.target, "tip": tip, "last_green": last_green}
+        OUT.result = {"target": gate.target, "tip": tip, "last_green": last_green,
+                      "recovered": gate.reconcile_reverts(tip, last_green)}
         ok, log = gate.run_tests(tip, None)
         if ok:
             gate.write_json(gate.state / "verify.json", {"last_green": tip, "checked": time.time()})
@@ -1100,6 +1334,14 @@ def cmd_verify(gate: Gate, args: argparse.Namespace) -> int:
         title = git("log", "-1", "--format=%s", culprit, cwd=gate.root).strip()
         OUT.say(f"culprit  {culprit[:10]} {title!r}" + (f" (session {sid})" if sid else " (not from gate)"))
         OUT.result.update(culprit=culprit, culprit_session=sid or None, culprit_title=title)
+        parents = git("rev-list", "--parents", "-n", "1", culprit, cwd=gate.root).split()[1:]
+        if len(parents) != 1:
+            # gate only lands single-parent squash commits; a merge (even one carrying gate trailers)
+            # would be reverted against its first parent, undoing a whole branch. A human decides.
+            reason = f"culprit is a merge commit with {len(parents)} parents; revert it manually"
+            OUT.say(reason)
+            OUT.result["reason"] = reason
+            return EXIT_NEEDS_HUMAN
         if not sid or args.no_revert:
             return EXIT_NEEDS_HUMAN
         proc = git_run("merge-tree", "--write-tree", f"--merge-base={culprit}", tip, f"{culprit}^",
@@ -1120,6 +1362,7 @@ def cmd_verify(gate: Gate, args: argparse.Namespace) -> int:
         if published is None:
             OUT.say(f"{gate.target} moved during verification; run verify again")
             return EXIT_TARGET_MOVED
+        fault_point("after-revert-publish")
         with contextlib.suppress(GateError):
             gate.update(sid, status="reverted", reason="post-merge verification failed",
                         detail=log, reverted_by=published[-1], finished=time.time())
@@ -1151,8 +1394,7 @@ def cmd_trace(gate: Gate, args: argparse.Namespace) -> int:
         raise GateError(f"trace NOT stored: external scanner still finds secrets after redaction: {external}")
     data = clean.encode("utf-8")
     path = gate.state / "traces" / f"{args.session}.jsonl.gz"
-    with gzip.open(path, "wb") as handle:
-        handle.write(data)
+    write_atomic(path, gzip.compress(data))
     record = {
         "sha256": hashlib.sha256(data).hexdigest(),
         "raw_bytes": len(data),
@@ -1184,10 +1426,12 @@ def cmd_gc(gate: Gate, args: argparse.Namespace) -> int:
         grace = retention["reject_grace_hours"] * 3600
         if session["status"] == "rejected" and now - finished >= grace:
             gate.archive(session)
-            gate.cleanup(session)
-            gate.update(session["id"], status="abandoned")
-            session["status"] = "abandoned"
-            archived += 1
+            # Only if nobody resubmitted it meanwhile: an agent may have fixed and resubmitted it after
+            # this loop read the session list, and then its branch must stay.
+            if gate.update(session["id"], session.get("head"), "rejected", status="abandoned"):
+                gate.cleanup(session)
+                session["status"] = "abandoned"
+                archived += 1
         trace = session.get("trace")
         if trace and not trace.get("deleted") and session["status"] not in IN_FLIGHT:
             days = retention["trace_days_merged"] if session["status"] == "merged" \
@@ -1326,7 +1570,16 @@ def cmd_doctor(gate: Gate, args: argparse.Namespace) -> int:
     report(has_policy, f"{CONFIG_FILE} committed on target", "" if has_policy else "using built-in defaults")
     suites = gate.suites()
     report(bool(suites) or None, "test suites", ", ".join(s["name"] for s in suites) or "none: nothing is tested")
-    report(not gate.target_checked_out(), "target not checked out in any worktree")
+    checked_out = gate.target_checked_out()
+    if checked_out and args.fix:
+        current = git_run("symbolic-ref", "--quiet", "HEAD", cwd=gate.root).stdout.strip()
+        main_clean = not git("status", "--porcelain", "--untracked-files=no", cwd=gate.root).strip()
+        if current == f"refs/heads/{gate.target}" and main_clean:
+            git("switch", "--quiet", "--detach", cwd=gate.root)
+            OUT.say(f"fixed: detached {gate.root} from '{gate.target}'")
+            checked_out = gate.target_checked_out()
+    report(not checked_out, "target not checked out in any worktree",
+           "run `gate doctor --fix` (main checkout) or switch that worktree away" if checked_out else "")
     lanes = gate.config["lanes"]
     report(True if lanes else None, "lanes", ", ".join(lanes) or "none: all sessions share one queue")
     if gate.config["secret_scan_command"]:
@@ -1453,7 +1706,63 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="check git, policy, tests, scanner and remote readiness")
     doctor.add_argument("--write-test", action="store_true",
                         help="push and delete a scratch ref on the remote to prove write access")
+    doctor.add_argument("--fix", action="store_true",
+                        help="detach the main checkout if it has the target branch checked out (and is clean)")
+
+    completion = sub.add_parser("completion", help="print a shell completion script (bash, zsh, fish)",
+                                description="Print a completion script, e.g. `gate completion bash >> ~/.bashrc` "
+                                            "or `gate completion fish > ~/.config/fish/completions/gate.fish`.")
+    completion.add_argument("shell", choices=["bash", "zsh", "fish"])
+
+    # --json is accepted before or after the subcommand (`gate --json queue` or `gate queue --json`).
+    for subparser in sub.choices.values():
+        subparser.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                               help="print one machine-readable JSON document instead of text")
     return parser
+
+
+def completion_script(shell: str) -> str:
+    """Completion generated from the parser itself, so it can't drift from the real options."""
+    parser = build_parser()
+    subactions = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)]
+    commands = dict(subactions[0].choices) if subactions else {}
+    global_opts = sorted(o for a in parser._actions for o in a.option_strings if o.startswith("--"))
+    options = {name: sorted(o for a in sub_parser._actions for o in a.option_strings if o.startswith("--"))
+               for name, sub_parser in commands.items()}
+    if shell == "fish":
+        lines = [f"complete -c gate -f -n __fish_use_subcommand -a {name!r}" for name in commands]
+        for name, opts in options.items():
+            lines += [f"complete -c gate -f -n '__fish_seen_subcommand_from {name}' -l {opt[2:]}" for opt in opts]
+        lines += [f"complete -c gate -f -n __fish_use_subcommand -l {opt[2:]}" for opt in global_opts]
+        return "\n".join(lines) + "\n"
+    cases = "\n".join(f'        {name}) opts="{" ".join(opts)}" ;;' for name, opts in options.items())
+    script = f"""_gate() {{
+    local cur="${{COMP_WORDS[COMP_CWORD]}}" cmd="" word opts
+    for word in "${{COMP_WORDS[@]:1:COMP_CWORD-1}}"; do
+        case "$word" in -*) ;; *) cmd="$word"; break ;; esac
+    done
+    if [ -z "$cmd" ]; then
+        COMPREPLY=($(compgen -W "{' '.join(commands)} {' '.join(global_opts)}" -- "$cur"))
+        return
+    fi
+    case "$cmd" in
+{cases}
+        *) opts="" ;;
+    esac
+    COMPREPLY=($(compgen -W "$opts" -- "$cur"))
+}}
+complete -o default -F _gate gate
+"""
+    if shell == "zsh":
+        script = "autoload -U +X bashcompinit && bashcompinit\n" + script
+    return script
+
+
+def cmd_completion(gate: Gate, args: argparse.Namespace) -> int:
+    script = completion_script(args.shell)
+    OUT.say(script.rstrip("\n"))
+    OUT.result = {"shell": args.shell, "script": script}
+    return 0
 
 
 COMMANDS = {
@@ -1470,6 +1779,7 @@ COMMANDS = {
     "show": cmd_show,
     "stats": cmd_stats,
     "doctor": cmd_doctor,
+    "completion": cmd_completion,
 }
 
 

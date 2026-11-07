@@ -5,7 +5,12 @@ created in one `git fast-import`), a test suite that sleeps T seconds (a stand-i
 for real CI), then drains the queue with --parallel 1 and --parallel L and reports
 merges/hour, the serialized publish cost, and how many publishes were commuted.
 
+With --test-seconds-max, every candidate's suite sleeps a different time, drawn uniformly
+between --test-seconds and --test-seconds-max from a hash of the candidate commit (so
+reruns are reproducible), which is closer to real CI than a fixed sleep.
+
     python bench.py --sessions 240 --lanes 8 --test-seconds 2 --batch 8
+    python bench.py --sessions 400 --lanes 8 --test-seconds 1 --test-seconds-max 5 --batch 8 --modes 8
 """
 from __future__ import annotations
 
@@ -41,7 +46,21 @@ def gate(repo: Path, *argv: str) -> str:
     return out.getvalue()
 
 
-def build_repo(root: Path, sessions: int, lanes: int, test_seconds: float, batch: int) -> Path:
+SLOW_SUITE = """\
+import hashlib
+import subprocess
+import sys
+import time
+
+low, high = float(sys.argv[1]), float(sys.argv[2])
+head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+fraction = int(hashlib.sha1(head.encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
+time.sleep(low + (high - low) * fraction)
+"""
+
+
+def build_repo(root: Path, sessions: int, lanes: int, test_seconds: float, batch: int,
+               test_seconds_max: float | None = None) -> Path:
     repo = root / "repo"
     repo.mkdir(parents=True)
     run_git("init", "-q", "-b", "main", cwd=repo)
@@ -52,8 +71,12 @@ def build_repo(root: Path, sessions: int, lanes: int, test_seconds: float, batch
         (repo / f"svc{lane}" / "README.md").write_text(f"service {lane}\n")
     lane_table = "".join(f"svc{lane} = ['svc{lane}/*']\n" for lane in range(lanes))
     config = gatelib.SAMPLE_CONFIG
-    config = config.replace("test_command = 'python -m unittest discover -s tests'",
-                            f"test_command = '\"{sys.executable}\" -c \"import time; time.sleep({test_seconds})\"'")
+    if test_seconds_max is None:
+        command = f"\"{sys.executable}\" -c \"import time; time.sleep({test_seconds})\""
+    else:
+        (repo / "slow_suite.py").write_text(SLOW_SUITE)
+        command = f"\"{sys.executable}\" slow_suite.py {test_seconds} {test_seconds_max}"
+    config = config.replace("test_command = 'python -m unittest discover -s tests'", f"test_command = '{command}'")
     config = config.replace("max_batch = 4", f"max_batch = {batch}")
     config = config.replace("[lanes]\n", "[lanes]\n" + lane_table)
     (repo / "gate.toml").write_text(config)
@@ -83,10 +106,11 @@ def build_repo(root: Path, sessions: int, lanes: int, test_seconds: float, batch
     return repo
 
 
-def measure(sessions: int, lanes: int, test_seconds: float, batch: int, parallel: int) -> dict:
+def measure(sessions: int, lanes: int, test_seconds: float, batch: int, parallel: int,
+            test_seconds_max: float | None = None) -> dict:
     root = Path(tempfile.mkdtemp(prefix="gate-bench-"))
     try:
-        repo = build_repo(root, sessions, lanes, test_seconds, batch)
+        repo = build_repo(root, sessions, lanes, test_seconds, batch, test_seconds_max)
         started = time.perf_counter()
         gate(repo, "queue", "--drain", "--parallel", str(parallel))
         elapsed = time.perf_counter() - started
@@ -124,14 +148,20 @@ def main() -> None:
     parser.add_argument("--sessions", type=int, default=240)
     parser.add_argument("--lanes", type=int, default=8)
     parser.add_argument("--test-seconds", type=float, default=2.0)
+    parser.add_argument("--test-seconds-max", type=float, default=None,
+                        help="vary each candidate's test time uniformly in [--test-seconds, this]")
     parser.add_argument("--batch", type=int, default=8)
+    parser.add_argument("--modes", default=None, help="comma-separated --parallel values (default: 1,LANES)")
     args = parser.parse_args()
+    modes = [int(m) for m in args.modes.split(",")] if args.modes else [1, args.lanes]
+    timing = (f"{args.test_seconds} s" if args.test_seconds_max is None
+              else f"{args.test_seconds}-{args.test_seconds_max} s (uniform, seeded by commit)")
     print(f"{args.sessions} sessions, {args.lanes} lanes, batch {args.batch}, "
-          f"simulated test time {args.test_seconds} s per candidate\n")
+          f"simulated test time {timing} per candidate\n")
     print(f"{'parallel':>8} {'merged':>7} {'wall s':>8} {'merges/h':>9} {'CI runs':>8} "
           f"{'commuted':>9} {'hold ms':>8} {'wait+hold':>10} {'merges/day':>11} {'serial ceiling/day':>19}")
-    for parallel in (1, args.lanes):
-        r = measure(args.sessions, args.lanes, args.test_seconds, args.batch, parallel)
+    for parallel in modes:
+        r = measure(args.sessions, args.lanes, args.test_seconds, args.batch, parallel, args.test_seconds_max)
         # The only serialized step is the publish lock; its hold time bounds throughput
         # no matter how many lanes/CI workers run in parallel.
         ceiling = 86400 / (r["hold_ms_mean"] / 1000) * r["merges_per_publish"]
