@@ -7,7 +7,22 @@ codes are part of the public interface.
 
 Every finding of the round-2 review was checked in the code first; all were real and are fixed here.
 
-### Fixed
+### Fixed after the round-3 review (each reproduced by a failing test first)
+- **Malformed policy.** A `gate.toml` with a TOML syntax error, a value of the wrong type, or a `[[tests]]`
+  entry without `command` crashed with a traceback (the missing command only when `queue` reached it). The
+  policy is now validated when it is read; the error names the file, the line or key, and how to fix it.
+- **Forged provenance trailers.** `--model`, `--tool`, `--spec` and `--title` went into the squash commit
+  message verbatim, so a value containing a newline could add a fake `Agent-Head:` trailer and make crash
+  recovery mark another queued session as merged. `submit` now rejects multi-line values, and every value is
+  flattened to one line when the commit is written.
+- **verify and merge commits.** A merge commit on the target that carried an `Agent-Session` trailer could be
+  picked as the culprit and auto-reverted against its first parent, undoing a whole branch. verify now stops
+  with exit 3 for any merge-commit culprit.
+- **Kill while testing.** The crash-safety row "killed while testing a batch" is now proven with a real process
+  kill between the green test run and publication (`GATE_FAULT=after-tests`): nothing is published, the next
+  run re-lands the batch once.
+
+### Fixed during the round-2 review
 - **Locks across hosts.** Staleness compared a lock file's mtime with the local clock, so clock skew between
   hosts (or NFS attribute caching) could make a live lock look abandoned. Liveness is now judged by observation:
   a lock is taken over only after this process has watched it stay unchanged for `LOCK_STALE_S` on its own

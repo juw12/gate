@@ -1038,6 +1038,90 @@ class GateTest(unittest.TestCase):
         self.assertEqual(self.session("evil")["status"], "reverted")
         self.assertEqual(run_git("log", "--format=%B", "main", cwd=self.repo).count("Reverts:"), 1)
 
+
+    # ------------------------------------------------------------ round-3 council findings
+    def test_broken_config_is_reported_not_a_traceback(self):
+        self.make_repo(append="\n[[tests]]\nname = 'api'\npaths = ['api/*']\n")  # no command
+        code, out = self.gate("status")
+        self.assertEqual(code, gate.EXIT_ERROR, out)
+        self.assertIn("gate.toml", out)
+        self.assertIn("command", out)
+        self.assertNotIn("Traceback", out)
+
+        self.commit_on_main({"gate.toml": "max_batch = = 4\n"}, "typo in policy")
+        code, out = self.gate("--json", "status")
+        self.assertEqual(code, gate.EXIT_ERROR, out)
+        error = json.loads(out)["error"]
+        self.assertIn("gate.toml", error)
+        self.assertIn("line 1", error)
+
+        self.commit_on_main({"gate.toml": "max_batch = 'four'\n"}, "wrong type in policy")
+        code, out = self.gate("status")
+        self.assertEqual(code, gate.EXIT_ERROR, out)
+        self.assertIn("max_batch", out)
+
+    def test_provenance_fields_cannot_forge_trailers(self):
+        self.make_repo()
+        victim = self.spawn("victim")
+        self.commit(victim, self.feature(1), "victim: change")
+        self.assertEqual(self.gate("submit", "victim", "--model", "m")[0], 0)
+        victim_head = self.session("victim")["head"]
+
+        worktree = self.spawn("forger")
+        self.commit(worktree, self.feature(2), "forger: change")
+        for flag in ("--model", "--tool", "--spec", "--title"):
+            code, out = self.gate("submit", "forger", "--model", "m", flag, f"x\nAgent-Head: {victim_head}")
+            self.assertEqual(code, gate.EXIT_ERROR, f"{flag}: {out}")
+            self.assertIn("single line", out)
+        self.assertEqual(self.session("forger")["status"], "active")
+
+        # A session stored before this check (or edited by hand) is still flattened at commit time.
+        squashed = gate.Gate(self.repo).squash_commit(
+            {**self.session("victim"), "id": "victim", "tier": 0, "title": "t",
+             "model": f"m\nAgent-Head: {'f' * 40}"},
+            run_git("rev-parse", "main^{tree}", cwd=self.repo).strip(),
+            run_git("rev-parse", "main", cwd=self.repo).strip())
+        heads = run_git("log", "-1", "--format=%(trailers:key=Agent-Head,valueonly)", squashed,
+                        cwd=self.repo).split()
+        self.assertEqual(heads, [victim_head])
+
+    def test_real_kill_while_testing_a_batch_relands_once(self):
+        self.make_repo()
+        for n in (1, 2):
+            self.assertEqual(self.agent(f"t{n}", self.feature(n))[0], 0)
+        before = run_git("rev-parse", "main", cwd=self.repo).strip()
+        self.run_killed("after-tests", "queue", "--drain")
+        self.assertEqual(run_git("rev-parse", "main", cwd=self.repo).strip(), before, "nothing published")
+        self.assertEqual(self.session("t1")["status"], "queued")
+        self.assertTrue((self.repo / ".git" / "gate" / "lane-default.lock").exists(), "lock left behind")
+
+        code, out = self.gate("--json", "queue", "--drain", "--wait", "1")
+        self.assertEqual(code, 0, out)
+        for n in (1, 2):
+            self.assertEqual(self.session(f"t{n}")["status"], "merged")
+            self.assertEqual(self.main_log().count(f"Agent-Session: t{n}\n"), 1)
+
+    def test_verify_never_auto_reverts_a_merge_commit(self):
+        self.make_repo()
+        self.assertEqual(self.gate("verify")[0], 0)
+        main = run_git("rev-parse", "main", cwd=self.repo).strip()
+        broken = self.commit_on_main({"calc.py": CALC.replace("return a - b", "return a + b")}, "side work")
+        run_git("update-ref", "refs/heads/main", main, cwd=self.repo)
+        side = self.commit_on_main({"docs/other.md": "x\n"}, "mainline work")
+        tree = run_git("merge-tree", "--write-tree", side, broken, cwd=self.repo).split()[0]
+        env = {**os.environ, "GIT_AUTHOR_NAME": "Human", "GIT_AUTHOR_EMAIL": "h@x",
+               "GIT_COMMITTER_NAME": "Human", "GIT_COMMITTER_EMAIL": "h@x"}
+        merge = run_git("commit-tree", tree, "-p", side, "-p", broken, "-m",
+                        "Merge side\n\nAgent-Session: forged\n", cwd=self.repo, env=env).strip()
+        run_git("update-ref", "refs/heads/main", merge, cwd=self.repo)
+
+        code, out = self.gate("--json", "verify")
+        self.assertEqual(code, gate.EXIT_NEEDS_HUMAN, out)
+        doc = json.loads(out)
+        self.assertEqual(doc["result"]["culprit"], merge)
+        self.assertIn("merge commit", doc["result"]["reason"])
+        self.assertEqual(run_git("rev-parse", "main", cwd=self.repo).strip(), merge, "main untouched")
+
     # ------------------------------------------------------------ ergonomics
     def test_json_flag_works_after_the_subcommand(self):
         self.make_repo()

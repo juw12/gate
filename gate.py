@@ -371,8 +371,73 @@ def git_version() -> tuple[int, int]:
     return (int(numbers.group(1)), int(numbers.group(2))) if numbers else (0, 0)
 
 
+CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def one_line(value: Any) -> str:
+    """Collapse any whitespace or control characters so a value stays on one commit-message line."""
+    return " ".join(CONTROL_CHARS.sub(" ", str(value)).split())
+
+
 def matches(path: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)
+
+
+def _type_name(expected: type | tuple[type, ...]) -> str:
+    names = {str: "a string", int: "an integer", float: "a number", bool: "true or false",
+             list: "a list", dict: "a table"}
+    kinds = expected if isinstance(expected, tuple) else (expected,)
+    return " or ".join(names[kind] for kind in kinds)
+
+
+def _is(value: Any, expected: type | tuple[type, ...]) -> bool:
+    kinds = expected if isinstance(expected, tuple) else (expected,)
+    if isinstance(value, bool) and bool not in kinds:
+        return False  # TOML true/false is not a number
+    return isinstance(value, kinds)
+
+
+def _string_list_problem(name: str, value: Any) -> str | None:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return f"{name} must be a list of strings"
+    return None
+
+
+def config_problem(config: dict) -> str | None:
+    """First thing wrong with a merged config, phrased for the human who has to fix it; None if valid."""
+    for key, default in DEFAULT_CONFIG.items():
+        expected: type | tuple[type, ...] = (int, float) if isinstance(default, (int, float)) and not \
+            isinstance(default, bool) else type(default)
+        if not _is(config[key], expected):
+            return f"{key} must be {_type_name(expected)}, not {config[key]!r}"
+    for key in ("size_exempt", "secret_scan_exempt"):
+        problem = _string_list_problem(key, config[key])
+        if problem:
+            return problem
+    for key in ("high", "low"):
+        problem = _string_list_problem(f"risk.{key}", config["risk"].get(key, []))
+        if problem:
+            return problem
+    for lane, patterns in config["lanes"].items():
+        problem = _string_list_problem(f"lanes.{lane}", patterns)
+        if problem:
+            return problem
+    for key, value in config["retention"].items():
+        if not _is(value, (int, float)):
+            return f"retention.{key} must be a number, not {value!r}"
+    for index, suite in enumerate(config["tests"]):
+        where = f"[[tests]] entry {index + 1}" + (f" ({suite.get('name')})" if isinstance(suite, dict)
+                                                  and suite.get("name") else "")
+        if not isinstance(suite, dict):
+            return f"{where} must be a table"
+        if not isinstance(suite.get("command"), str) or not suite["command"].strip():
+            return f"{where} needs a command = '...' to run"
+        if "name" in suite and not isinstance(suite["name"], str):
+            return f"{where}: name must be a string"
+        problem = _string_list_problem(f"{where}: paths", suite.get("paths", []))
+        if problem:
+            return problem
+    return None
 
 
 def merged_config(overrides: dict) -> dict:
@@ -408,7 +473,16 @@ class Gate:
         proc = git_run("show", f"refs/heads/{self.target}:{CONFIG_FILE}", cwd=self.root)
         if proc.returncode != 0:
             return merged_config({})
-        return merged_config(tomllib.loads(proc.stdout))
+        source = f"{CONFIG_FILE} on {self.target}"
+        fix = f"fix it with a normal commit to {self.target}"
+        try:
+            overrides = tomllib.loads(proc.stdout)
+        except tomllib.TOMLDecodeError as error:
+            raise GateError(f"{source} is not valid TOML ({error}); {fix}") from None
+        problem = config_problem(merged_config(overrides))
+        if problem:
+            raise GateError(f"{source}: {problem}; {fix}")
+        return merged_config(overrides)
 
     def session_path(self, sid: str) -> Path:
         return self.state / "sessions" / f"{sid}.json"
@@ -805,8 +879,9 @@ class Gate:
             ("Agent-Base", session["base"]),
             ("Agent-Head", session["head"]),
         ]
-        body = "\n".join(f"{key}: {value}" for key, value in trailers if value)
-        message = f"{session['title']}\n\n{body}\n"
+        # Flatten every agent-supplied value: a newline would let it forge trailers such as Agent-Head.
+        body = "\n".join(f"{key}: {one_line(value)}" for key, value in trailers if value)
+        message = f"{one_line(session['title'])}\n\n{body}\n"
         return git("commit-tree", tree, "-p", parent, "-m", message, cwd=self.root,
                    env=self.commit_env(session["head"])).strip()
 
@@ -923,6 +998,7 @@ class Gate:
             files = self.changed_files(tip, candidate)
             ok, log = self.run_tests(candidate, files)
             if ok:
+                fault_point("after-tests")
                 published = self.publish(tip, [commit for _, commit in landed], files)
                 if published is None:
                     continue  # overlapping change landed meanwhile: rebuild and re-test
@@ -1106,6 +1182,11 @@ def cmd_submit(gate: Gate, args: argparse.Namespace) -> int:
     prompt_sha = None
     if args.prompt_file:
         prompt_sha = hashlib.sha256(Path(args.prompt_file).read_bytes()).hexdigest()
+    for flag in ("model", "tool", "spec", "title"):
+        value = getattr(args, flag)
+        if value and CONTROL_CHARS.search(value):
+            raise GateError(f"--{flag} must be a single line (no newlines or control characters); "
+                            "it is written into the commit message as provenance")
     title = args.title or git("log", "-1", "--format=%s", head, cwd=gate.root).strip()
 
     findings: list[str] = []
@@ -1235,6 +1316,14 @@ def cmd_verify(gate: Gate, args: argparse.Namespace) -> int:
         title = git("log", "-1", "--format=%s", culprit, cwd=gate.root).strip()
         OUT.say(f"culprit  {culprit[:10]} {title!r}" + (f" (session {sid})" if sid else " (not from gate)"))
         OUT.result.update(culprit=culprit, culprit_session=sid or None, culprit_title=title)
+        parents = git("rev-list", "--parents", "-n", "1", culprit, cwd=gate.root).split()[1:]
+        if len(parents) != 1:
+            # gate only lands single-parent squash commits; a merge (even one carrying gate trailers)
+            # would be reverted against its first parent, undoing a whole branch. A human decides.
+            reason = f"culprit is a merge commit with {len(parents)} parents; revert it manually"
+            OUT.say(reason)
+            OUT.result["reason"] = reason
+            return EXIT_NEEDS_HUMAN
         if not sid or args.no_revert:
             return EXIT_NEEDS_HUMAN
         proc = git_run("merge-tree", "--write-tree", f"--merge-base={culprit}", tip, f"{culprit}^",

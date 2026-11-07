@@ -17,7 +17,7 @@ needs a human.
 | Review load | Risk tiers from path policy. Tier 2 (auth, infra, CI, migrations, the policy file) waits for `approve --by NAME`. Changes over `max_changed_lines` bounce back to the agent. |
 | Secrets | Submit-time scan of added lines blocks the merge (`reason: secret`) without echoing the value. Traces and archived patches are redacted (known token formats, URL credentials, `key = value`, high-entropy tokens). An optional external scanner (e.g. gitleaks) fails closed: a trace it still flags is not stored. |
 | Integrity | Policy is read from the target branch; the exact submitted/approved head SHA is what merges. |
-| Provenance | `Agent-Session`, `Agent-Model`, `Agent-Tool`, `Spec`, `Prompt-SHA256`, `Trace-SHA256`, `Risk-Tier`, `Approved-By`, `Agent-Lane`, `Agent-Base`, `Agent-Head` trailers; author = agent, committer = `gate`. |
+| Provenance | `Agent-Session`, `Agent-Model`, `Agent-Tool`, `Spec`, `Prompt-SHA256`, `Trace-SHA256`, `Risk-Tier`, `Approved-By`, `Agent-Lane`, `Agent-Base`, `Agent-Head` trailers; author = agent, committer = `gate`. Agent-supplied values must be single-line, so they cannot forge a trailer. |
 | Retention / ref clutter | Merged sessions delete their branch at once; rejected ones keep it for a grace period, then become a gzipped, redacted diff outside Git refs. Traces expire by outcome. |
 | Checkout cost / remote agents | Shared object store, per-agent worktree with optional sparse cone, or `spawn --no-worktree` for agents running in remote sandboxes that push `agent/<id>`. |
 
@@ -119,7 +119,7 @@ python examples/agent_loop.py --repo . --session fix-1 --model my-model \
 | `0` | ok |
 | `1` | error: usage, git or environment problem; the remote refused the push (e.g. branch protection); a lock held by a live process; `doctor` found a failing check |
 | `2` | `submit` bounced by policy: `too_large`, or secrets on added lines (`rejected`, reason `secret`) |
-| `3` | `verify`: target is red and needs a human (no green baseline, revert conflicts, revert still red, or `--no-revert`) |
+| `3` | `verify`: target is red and needs a human (no green baseline, culprit not from gate or a merge commit, revert conflicts, revert still red, or `--no-revert`) |
 | `4` | `verify`: target moved while publishing the revert; run `verify` again |
 
 ## Crash safety
@@ -161,8 +161,9 @@ that is checked out in any worktree, whether in `queue`, a remote fetch or a `ve
 
 ## Measured
 
-Unit/e2e: `python -m unittest -v test_gate`, 55 tests on real repos (real-process kills, skewed and silent
-locks, contended locks, protected remote, JSON interface, remote races, verify/revert, secrets, clean UTF-8 docs).
+Unit/e2e: `python -m unittest -v test_gate`, 59 tests on real repos (real-process kills, skewed and silent
+locks, contended locks, protected remote, JSON interface, remote races, verify/revert, secrets, malformed
+policy, forged trailers, clean UTF-8 docs).
 CI runs them on Linux, macOS and Windows x Python 3.11/3.13 and also enforces `ruff`, `mypy` and ≥ 85 % line
 coverage of `gate.py`. The `nfs` workflow runs the two-host NFS test on every change to `gate.py`.
 
