@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""agentgate - a merge gate for AI-agent-generated changes.
+"""gate - a merge gate for AI-agent-generated changes.
 
 Many parallel agent sessions in, a few verified, provenance-tagged commits out.
 
@@ -41,7 +41,7 @@ import tomllib
 import uuid
 from pathlib import Path
 
-CONFIG_FILE = "agentgate.toml"
+CONFIG_FILE = "gate.toml"
 MIN_GIT = (2, 40)
 SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 IN_FLIGHT = {"active", "too_large", "needs_approval", "queued", "rejected"}
@@ -74,7 +74,7 @@ DEFAULT_CONFIG = {
 }
 
 SAMPLE_CONFIG = """\
-# agentgate policy. It is read from the TARGET BRANCH, not from a working tree,
+# gate policy. It is read from the TARGET BRANCH, not from a working tree,
 # so an agent cannot loosen it in its own worktree. Editing it is high-risk.
 
 # Always-run test command (empty = none). Add targeted suites with [[tests]] below.
@@ -92,12 +92,12 @@ max_batch = 4
 max_changed_lines = 400
 size_exempt = ['*.lock', 'package-lock.json', '*/generated/*']
 
-# Sessions at or above this tier need `agentgate approve`.
+# Sessions at or above this tier need `gate approve`.
 approval_tier = 2
 
 # If the target moved while a batch was testing, but none of the files that moved
 # overlap the batch, replay the batch onto the new tip without re-testing.
-# Cross-file semantic breakage is then caught by `agentgate verify`.
+# Cross-file semantic breakage is then caught by `gate verify`.
 commute_disjoint = true
 
 # Block merges whose added lines contain secrets. Optional external scanner:
@@ -108,7 +108,7 @@ secret_scan_command = ''
 
 [risk]
 # fnmatch patterns ("*" also matches "/"). Any high-risk file -> tier 2.
-high = ['agentgate.toml', '.github/*', 'auth/*', '*/auth/*', 'infra/*', '*migrations/*']
+high = ['gate.toml', '.github/*', 'auth/*', '*/auth/*', 'infra/*', '*migrations/*']
 # All files low-risk -> tier 0. Anything else -> tier 1.
 low = ['docs/*', '*.md', 'tests/*', '*/tests/*']
 
@@ -119,7 +119,7 @@ trace_days_merged = 730
 trace_days_unmerged = 14
 
 # Lanes: sessions whose files all fall in one lane are queued and tested in parallel
-# with other lanes (`agentgate queue --parallel N`). Everything else uses "default".
+# with other lanes (`gate queue --parallel N`). Everything else uses "default".
 [lanes]
 # api = ['services/api/*']
 # web = ['web/*']
@@ -276,11 +276,11 @@ class Gate:
         common = Path(git("rev-parse", "--git-common-dir", cwd=self.root).strip())
         if not common.is_absolute():
             common = (self.root / common).resolve()
-        self.state = common / "agentgate"
+        self.state = common / "gate"
         for sub in ("sessions", "attempts", "traces"):
             (self.state / sub).mkdir(parents=True, exist_ok=True)
         self.agents_dir = self.root.parent / f"{self.root.name}.agents"
-        configured = git_run("config", "agentgate.target", cwd=self.root).stdout.strip()
+        configured = git_run("config", "gate.target", cwd=self.root).stdout.strip()
         self.target = configured or "main"
         self.config = self._load_config()
 
@@ -341,7 +341,7 @@ class Gate:
                         path.unlink()
                         continue
                 if time.time() > deadline:
-                    raise GateError(f"{name} lock is held by another agentgate process ({path})")
+                    raise GateError(f"{name} lock is held by another gate process ({path})")
                 time.sleep(0.05)
         try:
             yield
@@ -430,7 +430,7 @@ class Gate:
         command = self.config["secret_scan_command"]
         if not command:
             return None
-        scratch = Path(tempfile.mkdtemp(prefix="agentgate-scan-"))
+        scratch = Path(tempfile.mkdtemp(prefix="gate-scan-"))
         try:
             target = scratch / "content.txt"
             target.write_text(text, encoding="utf-8")
@@ -485,7 +485,7 @@ class Gate:
 
     def _run_suite(self, commit: str, suite: dict) -> tuple[bool, str]:
         self.bump_counter("suite_runs")
-        scratch = Path(tempfile.mkdtemp(prefix="agentgate-ci-"))
+        scratch = Path(tempfile.mkdtemp(prefix="gate-ci-"))
         worktree = scratch / f"ci-{uuid.uuid4().hex[:12]}"
         git("worktree", "add", "--quiet", "--detach", str(worktree), commit, cwd=self.root)
         try:
@@ -508,8 +508,8 @@ class Gate:
             "GIT_AUTHOR_NAME": name,
             "GIT_AUTHOR_EMAIL": email,
             "GIT_AUTHOR_DATE": date,
-            "GIT_COMMITTER_NAME": "agentgate",
-            "GIT_COMMITTER_EMAIL": "agentgate@localhost",
+            "GIT_COMMITTER_NAME": "gate",
+            "GIT_COMMITTER_EMAIL": "gate@localhost",
         }
 
     def squash_commit(self, session: dict, tree: str, parent: str) -> str:
@@ -699,7 +699,7 @@ def cmd_init(gate: Gate, args) -> int:
         path.write_text(SAMPLE_CONFIG, encoding="utf-8")
         print(f"wrote {path}")
     git("config", "extensions.worktreeConfig", "true", cwd=gate.root)
-    print(f"next: edit test_command, commit {CONFIG_FILE} to '{gate.target}', run `agentgate doctor`,")
+    print(f"next: edit test_command, commit {CONFIG_FILE} to '{gate.target}', run `gate doctor`,")
     print(f"      and run the queue from a checkout that is not on '{gate.target}' (git switch --detach).")
     return 0
 
@@ -862,7 +862,7 @@ def cmd_verify(gate: Gate, args) -> int:
         sid = git("log", "-1", "--format=%(trailers:key=Agent-Session,valueonly)", culprit,
                   cwd=gate.root).strip()
         title = git("log", "-1", "--format=%s", culprit, cwd=gate.root).strip()
-        print(f"culprit  {culprit[:10]} {title!r}" + (f" (session {sid})" if sid else " (not from agentgate)"))
+        print(f"culprit  {culprit[:10]} {title!r}" + (f" (session {sid})" if sid else " (not from gate)"))
         if not sid or args.no_revert:
             return 3
         proc = git_run("merge-tree", "--write-tree", f"--merge-base={culprit}", tip, f"{culprit}^",
@@ -872,8 +872,8 @@ def cmd_verify(gate: Gate, args) -> int:
             return 3
         message = (f'Revert "{title}"\n\nPost-merge verification failed on {gate.target} @ {tip[:12]};\n'
                    f"bisected to this agent change.\n\nReverts: {culprit}\nAgent-Session: {sid}\n")
-        env = {**os.environ, "GIT_AUTHOR_NAME": "agentgate", "GIT_AUTHOR_EMAIL": "agentgate@localhost",
-               "GIT_COMMITTER_NAME": "agentgate", "GIT_COMMITTER_EMAIL": "agentgate@localhost"}
+        env = {**os.environ, "GIT_AUTHOR_NAME": "gate", "GIT_AUTHOR_EMAIL": "gate@localhost",
+               "GIT_COMMITTER_NAME": "gate", "GIT_COMMITTER_EMAIL": "gate@localhost"}
         revert = git("commit-tree", proc.stdout.split()[0], "-p", tip, "-m", message,
                      cwd=gate.root, env=env).strip()
         if not gate.run_tests(revert, None)[0]:
@@ -1068,7 +1068,7 @@ def cmd_doctor(gate: Gate, args) -> int:
         report(proc.returncode == 0, f"remote '{remote}' reachable, has {gate.target}",
                proc.stderr.strip()[-200:])
         if args.write_test and proc.returncode == 0:
-            probe = f"refs/heads/agentgate-doctor-{uuid.uuid4().hex[:8]}"
+            probe = f"refs/heads/gate-doctor-{uuid.uuid4().hex[:8]}"
             tip = gate.rev(f"refs/heads/{gate.target}")
             pushed = git_run("push", "--quiet", remote, f"{tip}:{probe}", cwd=gate.root)
             deleted = git_run("push", "--quiet", remote, f":{probe}", cwd=gate.root)
@@ -1082,11 +1082,11 @@ def cmd_doctor(gate: Gate, args) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="agentgate", description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(prog="gate", description=__doc__.split("\n\n")[0])
     parser.add_argument("-C", dest="repo", default=".", help="repository path (default: cwd)")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("init", help="write a sample agentgate.toml")
+    sub.add_parser("init", help="write a sample gate.toml")
 
     spawn = sub.add_parser("spawn", help="create a branch (+ worktree) for an agent session")
     spawn.add_argument("session")
@@ -1163,7 +1163,7 @@ def main(argv: list[str] | None = None) -> int:
         gate = Gate(Path(args.repo).resolve())
         return COMMANDS[args.command](gate, args)
     except GateError as error:
-        print(f"agentgate: {error}", file=sys.stderr)
+        print(f"gate: {error}", file=sys.stderr)
         return 1
 
 

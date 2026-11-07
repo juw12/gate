@@ -1,4 +1,4 @@
-"""Simulate a day of parallel agent sessions through the agentgate CLI.
+"""Simulate a day of parallel agent sessions through the gate CLI.
 
 Creates ./demo-workspace/repo, spawns 26 agent sessions with a realistic mix
 (good changes, broken changes, conflicting pairs, a high-risk change, an oversized
@@ -33,7 +33,7 @@ def sh(*args: str, cwd: Path = REPO, check: bool = True) -> str:
 
 
 def gate(*args: str) -> str:
-    return sh(sys.executable, str(HERE / "agentgate.py"), "-C", str(REPO), *args)
+    return sh(sys.executable, str(HERE / "gate.py"), "-C", str(REPO), *args)
 
 
 def write_and_commit(worktree: Path, files: dict[str, str], message: str) -> None:
@@ -82,11 +82,11 @@ def setup_repo() -> None:
         (REPO / name).parent.mkdir(parents=True, exist_ok=True)
         (REPO / name).write_text(content)
     gate("init")
-    config = (REPO / "agentgate.toml").read_text().replace(
+    config = (REPO / "gate.toml").read_text().replace(
         "test_command = 'python -m unittest discover -s tests'",
         f"test_command = '\"{sys.executable}\" -m unittest discover -s tests -q'",
     ).replace("[lanes]\n", "[lanes]\nlib = ['lib/*']\n")
-    (REPO / "agentgate.toml").write_text(config)
+    (REPO / "gate.toml").write_text(config)
     sh("git", "add", ".")
     sh("git", "commit", "-qm", "initial")
     sh("git", "switch", "-q", "--detach")

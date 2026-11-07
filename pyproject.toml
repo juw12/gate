@@ -3,14 +3,14 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agentgate"
+name = "gate"
 version = "0.1.0"
 description = "Merge gate for AI-agent-generated changes: batched, tested, risk-tiered, provenance-tagged."
 requires-python = ">=3.11"
 readme = "README.md"
 
 [project.scripts]
-agentgate = "agentgate:main"
+gate = "gate:main"
 
 [tool.setuptools]
-py-modules = ["agentgate"]
+py-modules = ["gate"]

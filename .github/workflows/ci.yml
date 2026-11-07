@@ -20,7 +20,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      # agentgate needs git >= 2.40 (merge-tree --merge-base); Apple's bundled git can be older.
+      # gate needs git >= 2.40 (merge-tree --merge-base); Apple's bundled git can be older.
       - name: Newer git on macOS
         if: runner.os == 'macOS'
         run: |
@@ -35,7 +35,7 @@ jobs:
           git config --global init.defaultBranch main
 
       - name: Unit + end-to-end tests
-        run: python -m unittest -v test_agentgate
+        run: python -m unittest -v test_gate
 
       - name: Demo
         run: python demo.py

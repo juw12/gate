@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import agentgate
+import gate
 
 PY = sys.executable
 
@@ -65,7 +65,7 @@ def remove_tree(path: Path) -> None:
 
 class GateTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="agentgate-test-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="gate-test-"))
         self.repo = self.tmp / "repo"
 
     def tearDown(self):
@@ -93,7 +93,7 @@ class GateTest(unittest.TestCase):
         if remote:
             settings["remote"] = "'origin'"
         settings.update(overrides or {})
-        lines = agentgate.SAMPLE_CONFIG.splitlines()
+        lines = gate.SAMPLE_CONFIG.splitlines()
         for key, value in settings.items():
             index = next(i for i, line in enumerate(lines) if line.startswith(f"{key} ="))
             lines[index] = f"{key} = {value}"
@@ -101,7 +101,7 @@ class GateTest(unittest.TestCase):
         if lanes:
             entries = "".join(f"{name} = {json.dumps(patterns)}\n" for name, patterns in lanes.items())
             config = config.replace("[lanes]\n", "[lanes]\n" + entries)
-        (self.repo / "agentgate.toml").write_text(config + append)
+        (self.repo / "gate.toml").write_text(config + append)
         run_git("add", ".", cwd=self.repo)
         run_git("commit", "-qm", "initial", cwd=self.repo)
         if remote:
@@ -113,7 +113,7 @@ class GateTest(unittest.TestCase):
     def gate(self, *argv: str) -> tuple[int, str]:
         out = io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-            code = agentgate.main(["-C", str(self.repo), *argv])
+            code = gate.main(["-C", str(self.repo), *argv])
         return code, out.getvalue()
 
     def spawn(self, sid: str, *extra: str) -> Path:
@@ -160,7 +160,7 @@ class GateTest(unittest.TestCase):
         }
 
     def session(self, sid: str) -> dict:
-        path = self.repo / ".git" / "agentgate" / "sessions" / f"{sid}.json"
+        path = self.repo / ".git" / "gate" / "sessions" / f"{sid}.json"
         return json.loads(path.read_text())
 
     def main_log(self) -> str:
@@ -170,7 +170,7 @@ class GateTest(unittest.TestCase):
         return run_git("show", f"main:{name}", cwd=self.repo)
 
     def counter(self, name: str) -> float:
-        path = self.repo / ".git" / "agentgate" / "counters.json"
+        path = self.repo / ".git" / "gate" / "counters.json"
         return json.loads(path.read_text()).get(name, 0) if path.exists() else 0
 
     # ------------------------------------------------------------ core gate
@@ -193,7 +193,7 @@ class GateTest(unittest.TestCase):
             self.assertIn(f"Spec: SPEC-a{n}", log)
         self.assertIn("Agent-Model: model-a", log)
         author = run_git("log", "-1", "--format=%an|%cn", "main", cwd=self.repo).strip()
-        self.assertEqual(author, "Agent Bot|agentgate")
+        self.assertEqual(author, "Agent Bot|gate")
         self.assertEqual(run_git("for-each-ref", "refs/heads/agent/", cwd=self.repo), "")
         code, out = self.gate("stats")
         self.assertIn("CI runs: 1", out)
@@ -265,10 +265,10 @@ class GateTest(unittest.TestCase):
     def test_policy_comes_from_target_not_agent_worktree(self):
         self.make_repo()
         worktree = self.spawn("sneaky")
-        policy = (worktree / "agentgate.toml").read_text()
+        policy = (worktree / "gate.toml").read_text()
         policy = policy.replace("max_changed_lines = 400", "max_changed_lines = 100000")
         big = "".join(f"x{i} = {i}\n" for i in range(600))
-        self.commit(worktree, {"agentgate.toml": policy, "lib/big.py": big}, "loosen policy")
+        self.commit(worktree, {"gate.toml": policy, "lib/big.py": big}, "loosen policy")
         code, out = self.gate("submit", "sneaky", "--model", "model-a")
         self.assertEqual(code, 2, out)
         self.assertEqual(self.session("sneaky")["status"], "too_large")
@@ -309,7 +309,7 @@ class GateTest(unittest.TestCase):
         )
         code, out = self.gate("trace", "tried", str(trace))
         self.assertEqual(code, 0, out)
-        stored = self.repo / ".git" / "agentgate" / "traces" / "tried.jsonl.gz"
+        stored = self.repo / ".git" / "gate" / "traces" / "tried.jsonl.gz"
         with gzip.open(stored, "rt") as handle:
             content = handle.read()
         for secret in ("AKIAABCDEFGHIJKLMNOP", "hunter2xyz", "ghp_aaaa"):
@@ -318,7 +318,7 @@ class GateTest(unittest.TestCase):
 
         code, out = self.gate("abandon", "tried")
         self.assertEqual(code, 0, out)
-        archive = self.repo / ".git" / "agentgate" / "attempts" / "tried.json.gz"
+        archive = self.repo / ".git" / "gate" / "attempts" / "tried.json.gz"
         with gzip.open(archive, "rt") as handle:
             self.assertIn("feature_4", json.load(handle)["patch"])
         self.assertEqual(run_git("for-each-ref", "refs/heads/agent/", cwd=self.repo), "")
@@ -349,7 +349,7 @@ class GateTest(unittest.TestCase):
         self.agent("a1", self.feature(1))
         outsider = self.tmp / "outsider"
         run_git("clone", "-q", str(self.origin), str(outsider), cwd=self.tmp)
-        original = agentgate.Gate.run_tests
+        original = gate.Gate.run_tests
         calls = {"n": 0}
 
         def run_tests_with_race(gate_self, commit, changed=None):
@@ -361,7 +361,7 @@ class GateTest(unittest.TestCase):
                 run_git("push", "-q", "origin", "main", cwd=outsider)
             return original(gate_self, commit, changed)
 
-        with mock.patch.object(agentgate.Gate, "run_tests", run_tests_with_race):
+        with mock.patch.object(gate.Gate, "run_tests", run_tests_with_race):
             code, out = self.gate("queue", "--drain")
         self.assertEqual(code, 0, out)
         self.assertEqual(self.session("a1")["status"], "merged")
@@ -377,7 +377,7 @@ class GateTest(unittest.TestCase):
     def test_overlapping_move_forces_retest(self):
         self.make_repo()
         self.agent("a1", {"calc.py": CALC.replace("return a + b", "return b + a")})
-        original = agentgate.Gate.run_tests
+        original = gate.Gate.run_tests
         calls = {"n": 0}
 
         def run_tests_with_race(gate_self, commit, changed=None):
@@ -386,7 +386,7 @@ class GateTest(unittest.TestCase):
                 self.commit_on_main({"calc.py": CALC.replace("return a - b", "return -(b - a)")})
             return original(gate_self, commit, changed)
 
-        with mock.patch.object(agentgate.Gate, "run_tests", run_tests_with_race):
+        with mock.patch.object(gate.Gate, "run_tests", run_tests_with_race):
             code, out = self.gate("queue", "--drain")
         self.assertEqual(code, 0, out)
         self.assertEqual(self.session("a1")["status"], "merged")
@@ -455,7 +455,7 @@ class GateTest(unittest.TestCase):
         self.gate("queue", "--drain")
         self.agent("evil", {"calc.py": CALC.replace("return a - b", "return a + b")})
         self.agent("good2", self.feature(2))
-        with mock.patch.object(agentgate.Gate, "run_tests", lambda *a, **k: (True, "pretend")):
+        with mock.patch.object(gate.Gate, "run_tests", lambda *a, **k: (True, "pretend")):
             self.gate("queue", "--drain")
         self.assertEqual(self.session("evil")["status"], "merged")
         self.assertNotIn("return a - b", self.main_file("calc.py"), "main is red before verify")
@@ -503,7 +503,7 @@ class GateTest(unittest.TestCase):
         trace.write_text("\n".join(json.dumps({"k": key, "v": value}) for key, value in secrets.items()))
         code, out = self.gate("trace", "t1", str(trace))
         self.assertEqual(code, 0, out)
-        with gzip.open(self.repo / ".git" / "agentgate" / "traces" / "t1.jsonl.gz", "rt") as handle:
+        with gzip.open(self.repo / ".git" / "gate" / "traces" / "t1.jsonl.gz", "rt") as handle:
             stored = handle.read()
         for value in ("SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV", "s3cretpw", "4eC39HqLyjWDarjtT1zdp7dc",
                       "Zx9Qm2Lp8Vt4Rk7Wn3Hs6Yb1Jd5Fg0Ac"):
@@ -516,11 +516,11 @@ class GateTest(unittest.TestCase):
         code, out = self.gate("trace", "t2", str(unknown))
         self.assertEqual(code, 1, out)
         self.assertIn("NOT stored", out)
-        self.assertFalse((self.repo / ".git" / "agentgate" / "traces" / "t2.jsonl.gz").exists())
+        self.assertFalse((self.repo / ".git" / "gate" / "traces" / "t2.jsonl.gz").exists())
 
     def test_redaction_leaves_git_hashes_and_prose_alone(self):
         text = "commit 3f9a2c7e5b1d4f6a8c0e2b4d6f8a0c2e4b6d8f0a merged; see docs/guide.md"
-        self.assertEqual(agentgate.redact(text), (text, 0))
+        self.assertEqual(gate.redact(text), (text, 0))
 
     # ------------------------------------------------------------ operability
     def test_doctor_checks_remote_write_access(self):
@@ -529,7 +529,7 @@ class GateTest(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn("push access ok", out)
         refs = run_git("--git-dir", str(self.origin), "for-each-ref", "refs/heads/", cwd=self.tmp)
-        self.assertNotIn("agentgate-doctor", refs)
+        self.assertNotIn("gate-doctor", refs)
 
 
 if __name__ == "__main__":

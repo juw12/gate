@@ -22,7 +22,7 @@ import tempfile
 import time
 from pathlib import Path
 
-import agentgate
+import gate as gatelib
 
 
 def run_git(*args: str, cwd: Path, input_bytes: bytes | None = None) -> str:
@@ -35,9 +35,9 @@ def run_git(*args: str, cwd: Path, input_bytes: bytes | None = None) -> str:
 def gate(repo: Path, *argv: str) -> str:
     out = io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-        code = agentgate.main(["-C", str(repo), *argv])
+        code = gatelib.main(["-C", str(repo), *argv])
     if code not in (0, 2):
-        raise SystemExit(f"agentgate {' '.join(argv)} failed:\n{out.getvalue()}")
+        raise SystemExit(f"gate {' '.join(argv)} failed:\n{out.getvalue()}")
     return out.getvalue()
 
 
@@ -51,12 +51,12 @@ def build_repo(root: Path, sessions: int, lanes: int, test_seconds: float, batch
         (repo / f"svc{lane}").mkdir()
         (repo / f"svc{lane}" / "README.md").write_text(f"service {lane}\n")
     lane_table = "".join(f"svc{lane} = ['svc{lane}/*']\n" for lane in range(lanes))
-    config = agentgate.SAMPLE_CONFIG
+    config = gatelib.SAMPLE_CONFIG
     config = config.replace("test_command = 'python -m unittest discover -s tests'",
                             f"test_command = '\"{sys.executable}\" -c \"import time; time.sleep({test_seconds})\"'")
     config = config.replace("max_batch = 4", f"max_batch = {batch}")
     config = config.replace("[lanes]\n", "[lanes]\n" + lane_table)
-    (repo / "agentgate.toml").write_text(config)
+    (repo / "gate.toml").write_text(config)
     run_git("add", ".", cwd=repo)
     run_git("commit", "-qm", "initial", cwd=repo)
     run_git("switch", "-q", "--detach", cwd=repo)
@@ -84,13 +84,13 @@ def build_repo(root: Path, sessions: int, lanes: int, test_seconds: float, batch
 
 
 def measure(sessions: int, lanes: int, test_seconds: float, batch: int, parallel: int) -> dict:
-    root = Path(tempfile.mkdtemp(prefix="agentgate-bench-"))
+    root = Path(tempfile.mkdtemp(prefix="gate-bench-"))
     try:
         repo = build_repo(root, sessions, lanes, test_seconds, batch)
         started = time.perf_counter()
         gate(repo, "queue", "--drain", "--parallel", str(parallel))
         elapsed = time.perf_counter() - started
-        state = repo / ".git" / "agentgate"
+        state = repo / ".git" / "gate"
         statuses = [json.loads(p.read_text())["status"] for p in (state / "sessions").glob("*.json")]
         counters = json.loads((state / "counters.json").read_text())
         merged = statuses.count("merged")
