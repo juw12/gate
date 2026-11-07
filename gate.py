@@ -550,22 +550,35 @@ class Gate:
         try:
             fd = os.open(breaker, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except (FileExistsError, PermissionError):
-            observed = self._read_lock(breaker)
-            if observed and self._unchanged_for(breaker, *observed) > BREAK_STALE_S:
-                with contextlib.suppress(OSError):
-                    breaker.unlink()  # a breaker that died mid-break
+            # stat(), not open(): on Windows an open handle would stop the breaker's owner deleting it.
+            try:
+                info = os.stat(breaker)
+            except OSError:
+                info = None
+            if info and self._unchanged_for(breaker, str(info.st_size), info.st_mtime) > BREAK_STALE_S:
+                self._unlink_retrying(breaker)  # a breaker that died mid-break
                 self._forget(breaker)
             time.sleep(0.01)
             return
         try:
             os.close(fd)
             if self._lock_is_stale(path):
-                with contextlib.suppress(FileNotFoundError, PermissionError):
-                    path.unlink()
+                self._unlink_retrying(path)
                 self._forget(path)
         finally:
-            with contextlib.suppress(OSError):
-                breaker.unlink()
+            self._unlink_retrying(breaker)
+
+    @staticmethod
+    def _unlink_retrying(path: Path) -> None:
+        """Delete a file, retrying briefly while another process holds it open (Windows refuses then)."""
+        for attempt in range(50):
+            try:
+                path.unlink()
+                return
+            except FileNotFoundError:
+                return
+            except PermissionError:
+                time.sleep(0.005 * min(attempt + 1, 10))
 
     def _lock_is_stale(self, path: Path) -> bool:
         observed = self._read_lock(path)

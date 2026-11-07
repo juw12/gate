@@ -124,10 +124,17 @@ def setup_repo() -> None:
         for name, body in files.items():
             Path(project, name).parent.mkdir(parents=True, exist_ok=True)
             Path(project, name).write_text(body)
-        run("docker", "cp", str(project), "host-a:/work/repo")
+        # docker cp cannot write into a mount made inside the container, so stream a tar over stdin.
+        archive = subprocess.run(["tar", "-C", scratch, "-cf", "-", "repo"], capture_output=True, check=True).stdout
+        put = subprocess.run(["docker", "exec", "-i", "host-a", "tar", "-C", "/work", "-xf", "-"], input=archive,
+                             capture_output=True)
+        if put.returncode != 0:
+            raise SystemExit(f"copying the project failed: {put.stderr.decode(errors='replace')}")
         for name, body in {"hold.py": HOLD, "contend.py": CONTEND}.items():
-            Path(scratch, name).write_text(body)
-            run("docker", "cp", str(Path(scratch, name)), f"host-a:/work/scripts/{name}")
+            put = subprocess.run(["docker", "exec", "-i", "host-a", "bash", "-c", f"cat > /work/scripts/{name}"],
+                                 input=body.encode(), capture_output=True)
+            if put.returncode != 0:
+                raise SystemExit(f"copying {name} failed: {put.stderr.decode(errors='replace')}")
     on("host-a", """
         set -e
         cd /work/repo && git init -q && git add -A && git commit -qm project
