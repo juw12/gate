@@ -62,6 +62,11 @@ The serialized publish step stops being the limit at about 400k merges/day on th
 Above that, throughput is set by CI capacity: about \(\text{lanes} \times \text{batch} / \text{test time}\).
 With 10-minute suites and batches of 8, 30k merges/day needs about 26 lanes' worth of CI workers.
 
+With `remote` set, each publish also does a fetch and a `--force-with-lease` push. Against
+github.com through a corporate HTTP proxy, that held the publish lock about 9 s per publish,
+a ceiling of \(86400 / 9 \times 8 \approx 77\text{k}\) merges/day at batch 8. That is still above 30k; raise
+`max_batch` or run the gate close to the remote if you need more.
+
 ## Publishing to GitHub
 
 Set `remote = 'origin'`. The gate fetches, merges and tests locally, then pushes with
@@ -69,6 +74,11 @@ Set `remote = 'origin'`. The gate fetches, merges and tests locally, then pushes
 branch. `agentgate doctor --write-test` proves reachability and write access by pushing and deleting a scratch ref.
 It cannot prove the bypass on the protected branch itself; only a real publish does.
 Agents never open PRs, so `refs/pull/*` doesn't grow.
+
+Verified against github.com (this repo, throwaway branch `agentgate-e2e`): `doctor --write-test`
+passed; a session published and GitHub's branch head matched the gate's merged commit; with a
+concurrent human push landing mid-test, the gate kept the human commit and replayed its own
+commit on top (`Commuted-From:`) without re-testing.
 
 ## What is still out of scope
 
@@ -80,5 +90,5 @@ Agents never open PRs, so `refs/pull/*` doesn't grow.
 - **One host holds the state.** Lanes run in parallel, and several gate processes on the same host can share a
   repo (file locks), but state lives in `.git/agentgate`. Running gates on several hosts needs a shared store.
   A Scion-class system would replace the file locks with a database.
-- **Verified on Windows only.** `.github/workflows/ci.yml` runs the tests, demo and benchmark on
-  Linux/macOS/Windows × Python 3.11/3.13 once this is pushed to GitHub.
+- **Platforms:** CI (`.github/workflows/ci.yml`) runs tests, demo and benchmark on Linux, macOS and
+  Windows × Python 3.11/3.13.

@@ -232,11 +232,21 @@ def git_run(*args: str, cwd: Path, env: dict | None = None,
     )
 
 
+# On Windows, a git process that reads a file while another one replaces it (lockfile +
+# rename) gets "Permission denied". These failures happen before git does any work, so
+# retrying is safe. Seen in CI with parallel lanes.
+TRANSIENT_GIT_ERRORS = ("unable to access", "Permission denied")
+
+
 def git(*args: str, cwd: Path, env: dict | None = None) -> str:
-    proc = git_run(*args, cwd=cwd, env=env)
-    if proc.returncode != 0:
-        raise GateError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
-    return proc.stdout
+    for attempt in range(6):
+        proc = git_run(*args, cwd=cwd, env=env)
+        if proc.returncode == 0:
+            return proc.stdout
+        if not any(marker in proc.stderr for marker in TRANSIENT_GIT_ERRORS):
+            break
+        time.sleep(0.05 * (2 ** attempt))
+    raise GateError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
 
 
 def git_version() -> tuple[int, int]:
@@ -573,12 +583,16 @@ class Gate:
     def cleanup(self, session: dict) -> None:
         if session.get("worktree") and Path(session["worktree"]).exists():
             git_run("worktree", "remove", "--force", session["worktree"], cwd=self.root)
+        # update-ref -d, not `branch -D`: branch -D rewrites .git/config, which races with
+        # concurrent git readers in other lanes on Windows.
+        ref = f"refs/heads/{session['branch']}"
         for _ in range(5):
-            proc = git_run("branch", "-D", session["branch"], cwd=self.root)
-            if proc.returncode == 0 or "not found" in proc.stderr:
+            exists = git_run("rev-parse", "--verify", "--quiet", ref, cwd=self.root).returncode == 0
+            if not exists or git_run("update-ref", "-d", ref, cwd=self.root).returncode == 0:
                 break
             time.sleep(0.1)  # packed-refs lock held by a concurrent lane
-        git_run("worktree", "prune", cwd=self.root)
+        if session.get("worktree"):
+            git_run("worktree", "prune", cwd=self.root)
 
     def archive(self, session: dict) -> Path:
         head = session.get("head")
