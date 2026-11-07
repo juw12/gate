@@ -47,7 +47,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 CONFIG_FILE = "gate.toml"
 LOCK_HEARTBEAT_S = 5.0   # a lock holder touches its lock file this often
@@ -1549,6 +1549,92 @@ def cmd_stats(gate: Gate, args: argparse.Namespace) -> int:
     return 0
 
 
+AUDIT_TRAILERS = ("Agent-Session", "Agent-Model", "Agent-Tool", "Spec", "Prompt-SHA256", "Trace-SHA256",
+                  "Risk-Tier", "Approved-By", "Agent-Lane", "Agent-Base", "Agent-Head", "Commuted-From",
+                  "Reverts")
+
+
+def _trailers(text: str) -> dict[str, str]:
+    found: dict[str, str] = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition(":")
+        if sep and key in AUDIT_TRAILERS and key not in found:
+            found[key] = value.strip()
+    return found
+
+
+def cmd_audit(gate: Gate, args: argparse.Namespace) -> int:
+    """Provenance evidence for a period: every change that reached the target, who or what made it, under
+    which policy, and every attempt the gate refused. Built from the target's own history (trailers) plus the
+    gate's local session records, so it can be re-run and checked by anyone with the repository."""
+    tip = gate.sync_tip()
+    window = [f"--since={args.since}"] if args.since else []
+    window += [f"--until={args.until}"] if args.until else []
+    raw = git("log", "--first-parent", "--format=%H%x1f%P%x1f%an <%ae>%x1f%cn%x1f%cI%x1f%s%x1f"
+              "%(trailers:only,unfold)%x1e", *window, tip, cwd=gate.root)
+    approval_tier = int(gate.config["approval_tier"])
+    commits: list[dict[str, Any]] = []
+    for record in filter(None, (r.strip("\n") for r in raw.split("\x1e"))):
+        sha, parents, author, committer, when, subject, trailer_text = (record.split("\x1f") + [""] * 7)[:7]
+        trailers = _trailers(trailer_text)
+        if "Reverts" in trailers and committer == "gate":
+            kind = "revert"
+        elif "Agent-Session" in trailers and "Agent-Head" in trailers and committer == "gate":
+            kind = "gate"
+        else:
+            kind = "direct"
+        commits.append({"commit": sha, "kind": kind, "merge": len(parents.split()) > 1, "author": author,
+                        "committer": committer, "date": when, "subject": subject, "trailers": trailers})
+    by_model: dict[str, int] = {}
+    findings: list[str] = []
+    for c in commits:
+        t = c["trailers"]
+        if c["kind"] == "gate":
+            model = t.get("Agent-Model", "(none recorded)")
+            by_model[model] = by_model.get(model, 0) + 1
+            tier = int(t.get("Risk-Tier", "0") or 0)
+            if tier >= approval_tier and not t.get("Approved-By"):
+                findings.append(f"{c['commit'][:10]} tier {tier} merged without Approved-By")
+        elif c["kind"] == "direct":
+            findings.append(f"{c['commit'][:10]} reached {gate.target} without the gate: {c['subject']!r} "
+                            f"by {c['author']}")
+    refused = [s for s in gate.sessions() if s["status"] in {"rejected", "too_large", "abandoned", "reverted",
+                                                             "needs_approval"}]
+    counts = {kind: sum(1 for c in commits if c["kind"] == kind) for kind in ("gate", "revert", "direct")}
+    period = f"{args.since or 'start'} .. {args.until or 'now'}"
+    lines = [f"# gate audit: {gate.target} @ {tip[:12]}", "",
+             f"Period: {period}. Policy: approval_tier {approval_tier}, max_changed_lines "
+             f"{gate.config['max_changed_lines']}, secret_scan {gate.config['secret_scan']}.", "",
+             f"- changes merged through the gate: {counts['gate']}",
+             f"- automatic reverts by verify: {counts['revert']}",
+             f"- changes that reached {gate.target} without the gate: {counts['direct']}",
+             f"- attempts refused or not merged (local records): {len(refused)}", ""]
+    lines += ["## Merged through the gate", "",
+              "| commit | date | model | tool | spec | tier | approved by | session |",
+              "|---|---|---|---|---|---|---|---|"]
+    for c in commits:
+        if c["kind"] == "gate":
+            t = c["trailers"]
+            lines.append(f"| {c['commit'][:10]} | {c['date'][:10]} | {t.get('Agent-Model', '')} | "
+                         f"{t.get('Agent-Tool', '')} | {t.get('Spec', '')} | {t.get('Risk-Tier', '')} | "
+                         f"{t.get('Approved-By', '')} | {t.get('Agent-Session', '')} |")
+    lines += ["", "## Refused or not merged", "", "| session | status | reason | model |", "|---|---|---|---|"]
+    for s in refused:
+        lines.append(f"| {s['id']} | {s['status']} | {one_line(s.get('reason') or '')} | {s.get('model') or ''} |")
+    lines += ["", "## Findings", ""] + ([f"- {f}" for f in findings] or ["- none"])
+    report = "\n".join(lines) + "\n"
+    if args.out:
+        write_atomic(Path(args.out), report.encode("utf-8"))
+    for line in lines:
+        OUT.say(line)
+    OUT.result = {"target": gate.target, "tip": tip, "since": args.since, "until": args.until,
+                  "counts": counts, "by_model": by_model, "commits": commits,
+                  "refused": [{"session": s["id"], "status": s["status"], "reason": s.get("reason"),
+                               "model": s.get("model")} for s in refused],
+                  "findings": findings, "out": args.out}
+    return EXIT_POLICY if args.strict and findings else 0
+
+
 def cmd_doctor(gate: Gate, args: argparse.Namespace) -> int:
     failures = 0
     checks: list[dict] = []
@@ -1703,6 +1789,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("stats", help="throughput, merge rate by model, retention footprint")
 
+    audit = sub.add_parser("audit", help="provenance evidence: what reached the target and who made it",
+                           description="Report every change on the target in a period: merged through the gate "
+                                       "(model, tool, spec, risk tier, approver), reverted by verify, or pushed "
+                                       "around the gate; plus refused attempts. Exit 2 with --strict if anything "
+                                       "bypassed the gate or a high-risk change lacks an approver.")
+    audit.add_argument("--since", help="start of the period (any git date, e.g. 2026-10-01 or '30 days ago')")
+    audit.add_argument("--until", help="end of the period (any git date)")
+    audit.add_argument("--out", help="also write the report as Markdown to this file")
+    audit.add_argument("--strict", action="store_true", help="exit 2 if there are findings")
+
     doctor = sub.add_parser("doctor", help="check git, policy, tests, scanner and remote readiness")
     doctor.add_argument("--write-test", action="store_true",
                         help="push and delete a scratch ref on the remote to prove write access")
@@ -1778,6 +1874,7 @@ COMMANDS = {
     "status": cmd_status,
     "show": cmd_show,
     "stats": cmd_stats,
+    "audit": cmd_audit,
     "doctor": cmd_doctor,
     "completion": cmd_completion,
 }
