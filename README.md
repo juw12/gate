@@ -1,5 +1,9 @@
 # gate
 
+[![ci](https://github.com/juw12/gate/actions/workflows/ci.yml/badge.svg)](https://github.com/juw12/gate/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/juw12/gate)](https://github.com/juw12/gate/releases)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A merge gate for AI-agent-generated code. Many parallel agent sessions go in; a small number of
 tested, risk-tiered, provenance-tagged commits come out. Humans review only what policy says
 needs a human.
@@ -19,10 +23,41 @@ needs a human.
 
 Standard library only. Python ≥ 3.11, Git ≥ 2.40.
 
+## How it works
+
+```mermaid
+flowchart LR
+  A1[agent session] -- spawn / commit --> B[agent/&lt;id&gt; branch]
+  A2[agent in remote sandbox] -- push --> B
+  B -- submit --> P{policy<br/>secrets · size · risk tier}
+  P -- bounced, exit 2 --> A1
+  P -- tier 2 --> H[human: gate approve]
+  P -- queued --> L[lane queue]
+  H --> L
+  L -- merge-tree batch --> T[targeted suites<br/>parallel, cached by tree]
+  T -- red: bisect --> R[rejected session]
+  T -- green --> PUB[publish<br/>serialized, compare-and-swap]
+  PUB -- target moved, disjoint files --> C[replay without re-test]
+  C --> PUB
+  PUB --> M[(target branch)]
+  M -- gate verify --> V{green?}
+  V -- red: bisect + revert --> M
+```
+
+State lives in `.git/gate/` (session JSON, counters, gzipped traces and archived diffs) and never in Git refs,
+so agent attempts don't bloat clones. Every write is a temp file + atomic rename; cross-process exclusion uses
+lock files that record `pid host`.
+
+## Install
+
+```bash
+pip install git+https://github.com/juw12/gate      # puts `gate` on PATH; or copy gate.py, it has no dependencies
+gate --version
+```
+
 ## Quick start
 
 ```bash
-pip install -e .                      # or: python gate.py ...
 cd your-repo
 gate init                        # writes gate.toml (lanes, suites, secrets, retention)
 git add gate.toml && git commit -m "gate policy"
@@ -44,11 +79,56 @@ gate stats
 gate gc                          # daily
 ```
 
-Exit codes: `0` ok, `1` error, `2` policy bounce (`too_large`, `secret`), `3` verify needs a human, `4` target moved during verify.
+## For agents and automation
+
+Put `--json` before the subcommand to get exactly one JSON document on stdout and nothing else:
+
+```console
+$ gate --json submit fix-1234 --model claude-x
+{"command": "submit", "exit_code": 0, "result": {"session": "fix-1234", "status": "queued", "tier": 1,
+ "lane": "api", "sized_lines": 42, "files": ["services/api/x.py"], "reason": null, "findings": [], ...},
+ "events": []}
+
+$ gate --json queue --drain
+{"command": "queue", "exit_code": 0, "result": {"lanes": ["api"], "merged": [{"session": "fix-1234",
+ "commit": "9f1c...", "lane": "api"}], "rejected": [], "recovered": [], "still_queued": 0}, "events": [...]}
+
+$ gate --json show nope
+{"command": "show", "exit_code": 1, "error": "unknown session 'nope'", "events": []}
+```
+
+An agent loop needs three calls: `spawn` (read `result.worktree`), `submit` (read `result.status`; on exit 2
+read `result.reason` / `result.findings`, fix and resubmit), then poll `gate --json show <id>` until
+`result.session.status` is `merged`, `rejected` (read `detail`) or `reverted`. `submit` is idempotent: retrying
+an unchanged queued session returns the same answer instead of an error.
+
+| Exit code | Meaning |
+|---|---|
+| `0` | ok |
+| `1` | error: usage, git or environment problem; a lock held by a live process; `doctor` found a failing check |
+| `2` | `submit` bounced by policy: `too_large`, or secrets on added lines (`rejected`, reason `secret`) |
+| `3` | `verify`: target is red and needs a human (no green baseline, revert conflicts, revert still red, or `--no-revert`) |
+| `4` | `verify`: target moved while publishing the revert; run `verify` again |
+
+## Crash safety
+
+Any gate process can be killed at any point without losing or duplicating work:
+
+| Killed while... | Next run |
+|---|---|
+| testing a batch | Nothing was published. The lane lock names a dead pid, so the next `queue` takes it over at once and re-lands the batch (passing suites are cached by tree, so they aren't re-run). |
+| publishing | The ref update is a single compare-and-swap (`update-ref old new`, or `push --force-with-lease`): it either happened or it didn't. |
+| after publishing, before recording `merged` | `queue` (and `gc`) first reconciles: every gate commit carries an `Agent-Head` trailer, so sessions whose head is already on the target are marked `merged` (`recovered: true`) instead of being landed twice. |
+| after recording `merged`, before deleting the branch | `gc` removes leftover branches and worktrees of merged/abandoned sessions. |
+
+Locks from a dead process on the same host are taken over immediately; a lock from another host (shared
+filesystem) is only broken after it is older than `max(1 h, 4 × test_timeout_s)`. These paths are covered by tests
+that simulate a kill after publish, leftover branches, and dead/live/remote lock owners.
 
 ## Measured
 
-Unit/e2e: `python -m unittest -v test_gate`, 22 tests on real repos.
+Unit/e2e: `python -m unittest -v test_gate`, 32 tests on real repos (crash recovery, contended locks, JSON interface,
+remote races, verify/revert, secrets). CI also enforces `ruff`, `mypy` and ≥ 85 % line coverage of `gate.py`.
 
 Throughput, from `python bench.py --sessions 160 --lanes 8 --test-seconds 2 --batch 8` on one Windows laptop
 (Git 2.55, Python 3.13), with a 2 s sleep standing in for CI:
@@ -92,3 +172,6 @@ commit on top (`Commuted-From:`) without re-testing.
   A Scion-class system would replace the file locks with a database.
 - **Platforms:** CI (`.github/workflows/ci.yml`) runs tests, demo and benchmark on Linux, macOS and
   Windows × Python 3.11/3.13.
+
+See [CHANGELOG.md](CHANGELOG.md) for releases and [CONTRIBUTING.md](CONTRIBUTING.md) to work on gate.
+MIT licensed.

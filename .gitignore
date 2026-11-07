@@ -5,3 +5,7 @@ build/
 dist/
 demo-workspace/
 *_output.txt
+
+.coverage
+.coverage.*
+

@@ -1,16 +1,47 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "gate"
-version = "0.1.0"
+version = "0.2.0"
 description = "Merge gate for AI-agent-generated changes: batched, tested, risk-tiered, provenance-tagged."
 requires-python = ">=3.11"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Juwen Lie" }]
+keywords = ["git", "merge-queue", "ai-agents", "code-review", "ci"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Version Control :: Git",
+]
+
+[project.urls]
+Homepage = "https://github.com/juw12/gate"
+Changelog = "https://github.com/juw12/gate/blob/main/CHANGELOG.md"
 
 [project.scripts]
 gate = "gate:main"
 
 [tool.setuptools]
 py-modules = ["gate"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "I"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = true
+
+[tool.coverage.run]
+include = ["gate.py"]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true

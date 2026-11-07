@@ -32,19 +32,30 @@ import math
 import os
 import re
 import shutil
+import socket
 import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 import uuid
 from pathlib import Path
 
+__version__ = "0.2.0"
+
 CONFIG_FILE = "gate.toml"
 MIN_GIT = (2, 40)
 SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 IN_FLIGHT = {"active", "too_large", "needs_approval", "queued", "rejected"}
+
+# Exit codes (stable; documented in README and `gate --help`).
+EXIT_OK = 0
+EXIT_ERROR = 1          # usage, git or environment error; doctor found a failing check
+EXIT_POLICY = 2         # submit bounced by policy: too large or secrets found
+EXIT_NEEDS_HUMAN = 3    # verify: target is red and could not be fixed automatically
+EXIT_TARGET_MOVED = 4   # verify: target moved while reverting; run again
 
 DEFAULT_CONFIG = {
     "test_command": "",
@@ -218,6 +229,59 @@ class Contention(Exception):
     """The target ref moved between reading the tip and publishing."""
 
 
+class Output:
+    """Human-readable lines by default; with --json, one JSON document on stdout instead."""
+
+    def __init__(self) -> None:
+        self.json = False
+        self.events: list[dict] = []
+        self.result: dict = {}
+        self._lock = threading.Lock()
+
+    def reset(self, json_mode: bool = False) -> None:
+        self.json = json_mode
+        self.events = []
+        self.result = {}
+
+    def say(self, text: str) -> None:
+        if not self.json:
+            print(text, flush=True)
+
+    def event(self, kind: str, text: str, **fields) -> None:
+        with self._lock:
+            self.events.append({"event": kind, **fields})
+        self.say(text)
+
+
+OUT = Output()
+
+
+def pid_alive(pid: int) -> bool:
+    """True if a process with this id is running on this host."""
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            return False
+        exit_code = ctypes.c_ulong()
+        ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+        kernel32.CloseHandle(handle)
+        return bool(ok) and exit_code.value == still_active
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def git_run(*args: str, cwd: Path, env: dict | None = None,
             input_text: str | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
@@ -327,27 +391,75 @@ class Gate:
 
     @contextlib.contextmanager
     def lock(self, name: str, timeout_s: float = 30.0, stale_s: float = 3600.0):
+        """Exclusive file lock. A lock left by a dead process on this host is taken over at once;
+        one from another host (or unreadable) is only broken after stale_s."""
         path = self.state / f"{name}.lock"
+        owner = f"{os.getpid()} {socket.gethostname()}"
         deadline = time.time() + timeout_s
         while True:
             try:
                 fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.write(fd, str(os.getpid()).encode())
+                os.write(fd, owner.encode())
                 os.close(fd)
                 break
             except (FileExistsError, PermissionError):
-                with contextlib.suppress(FileNotFoundError, PermissionError):
-                    if time.time() - path.stat().st_mtime > stale_s:
-                        path.unlink()
-                        continue
+                if self._lock_is_stale(path, stale_s):
+                    self._break_stale_lock(path, stale_s)
+                    continue
                 if time.time() > deadline:
-                    raise GateError(f"{name} lock is held by another gate process ({path})")
+                    raise GateError(f"{name} lock is held by another gate process ({path})") from None
                 time.sleep(0.05)
         try:
             yield
         finally:
-            with contextlib.suppress(FileNotFoundError):
+            self._release_lock(path)
+
+    @staticmethod
+    def _release_lock(path: Path) -> None:
+        # On Windows a concurrent reader (another process checking staleness) briefly blocks
+        # deletion; retry instead of leaving a lock that names a live pid.
+        for attempt in range(50):
+            try:
                 path.unlink()
+                return
+            except FileNotFoundError:
+                return
+            except PermissionError:
+                time.sleep(0.01 * min(attempt + 1, 10))
+        raise GateError(f"could not release lock {path}")
+
+    def _break_stale_lock(self, path: Path, stale_s: float) -> None:
+        """Remove a stale lock without racing other breakers: only the holder of `<lock>.break` may
+        delete it, after re-checking. A live owner never loses its lock, because a fresh lock file can
+        only appear after the stale one is gone, and only the breaker removes that."""
+        breaker = path.with_name(path.name + ".break")
+        try:
+            fd = os.open(breaker, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except (FileExistsError, PermissionError):
+            with contextlib.suppress(OSError):
+                if time.time() - breaker.stat().st_mtime > 10:  # a breaker that died mid-break
+                    breaker.unlink()
+            time.sleep(0.01)
+            return
+        try:
+            os.close(fd)
+            if self._lock_is_stale(path, stale_s):
+                with contextlib.suppress(FileNotFoundError, PermissionError):
+                    path.unlink()
+        finally:
+            with contextlib.suppress(OSError):
+                breaker.unlink()
+
+    @staticmethod
+    def _lock_is_stale(path: Path, stale_s: float) -> bool:
+        try:
+            owner = path.read_text(encoding="utf-8").split()
+            age = time.time() - path.stat().st_mtime
+        except (FileNotFoundError, PermissionError, OSError):
+            return False
+        if len(owner) == 2 and owner[1] == socket.gethostname() and owner[0].isdigit():
+            return not pid_alive(int(owner[0]))
+        return age > stale_s
 
     def update(self, sid: str, expected_head: str | None = None, **changes) -> bool:
         """Read-modify-write a session; skip if it was resubmitted with a new head."""
@@ -473,14 +585,14 @@ class Gate:
         workers = max(1, int(self.config["test_parallelism"]))
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
             results = list(pool.map(lambda s: self._run_suite(commit, s), pending))
-        passed = [s for s, (ok, _) in zip(pending, results) if ok]
+        passed = [s for s, (ok, _) in zip(pending, results, strict=True) if ok]
         if passed:
             with self.lock("state"):
                 cache = self.read_json("test-cache.json", {})
                 for suite in passed:
                     cache[key[suite["name"]]] = time.time()
                 self.write_json(self.state / "test-cache.json", cache)
-        failures = [f"[{s['name']}]\n{log}" for s, (ok, log) in zip(pending, results) if not ok]
+        failures = [f"[{s['name']}]\n{log}" for s, (ok, log) in zip(pending, results, strict=True) if not ok]
         return not failures, "\n".join(failures)[-4000:]
 
     def _run_suite(self, commit: str, suite: dict) -> tuple[bool, str]:
@@ -563,9 +675,10 @@ class Gate:
                         moved = set(self.changed_files(tested_tip, current))
                         if not self.config["commute_disjoint"] or moved & set(files):
                             return None
-                        to_publish = self.replay(commits, current)
-                        if to_publish is None:
+                        replayed = self.replay(commits, current)
+                        if replayed is None:
                             return None
+                        to_publish = replayed
                         self.bump_counter("commuted_publishes")
                     try:
                         self.advance(current, to_publish[-1])
@@ -649,12 +762,13 @@ class Gate:
                 if published is None:
                     continue  # overlapping change landed meanwhile: rebuild and re-test
                 now = time.time()
-                for (session, _), commit in zip(landed, published):
+                for (session, _), commit in zip(landed, published, strict=True):
                     if self.update(session["id"], session["head"], status="merged",
                                    merged_commit=commit, finished=now, reason=None):
                         self.cleanup(session)
-                    print(f"merged   {session['id']:<24} {commit[:10]}  [{session.get('lane', 'default')}]",
-                          flush=True)
+                    lane = session.get("lane", "default")
+                    OUT.event("merged", f"merged   {session['id']:<24} {commit[:10]}  [{lane}]",
+                              session=session["id"], commit=commit, lane=lane)
                 return deferred
             if len(landed) == 1:
                 self.reject(landed[0][0], "tests", log)
@@ -666,9 +780,42 @@ class Gate:
             return deferred
         raise GateError("target kept moving during publish; gave up after 5 attempts")
 
+    def reconcile(self, lane: str | None = None) -> list[str]:
+        """Crash recovery. A process killed after publishing but before recording the result
+        leaves sessions 'queued' although their squash commit is on the target. Every gate commit
+        carries an Agent-Head trailer, so find those sessions in target history and mark them
+        merged instead of landing them twice."""
+        queued = [s for s in self.sessions() if s["status"] == "queued"
+                  and (lane is None or s.get("lane", "default") == lane)]
+        if not queued:
+            return []
+        tip = self.sync_tip()
+        landed_heads: dict[str, dict[str, str]] = {}
+        recovered = []
+        for session in queued:
+            base = session["base"]
+            if base not in landed_heads:
+                log = git("log", "--format=%H%x00%(trailers:key=Agent-Head,valueonly,separator=%x2C)",
+                          tip, f"^{base}", cwd=self.root)
+                heads: dict[str, str] = {}
+                for line in log.splitlines():
+                    commit, _, trailer = line.partition("\x00")
+                    for head in filter(None, trailer.strip().split(",")):
+                        heads.setdefault(head.strip(), commit)
+                landed_heads[base] = heads
+            landed = landed_heads[base].get(session["head"])
+            if landed and self.update(session["id"], session["head"], status="merged", merged_commit=landed,
+                                      finished=time.time(), reason=None, recovered=True):
+                self.cleanup(session)
+                recovered.append(session["id"])
+                OUT.event("recovered", f"recovered {session['id']:<23} {landed[:10]}  (published by an "
+                          f"interrupted run)", session=session["id"], commit=landed)
+        return recovered
+
     def drain_lane(self, lane: str, drain: bool, wait: float) -> None:
         stale = max(3600.0, 4.0 * self.config["test_timeout_s"])
         with self.lock(f"lane-{lane}", timeout_s=wait, stale_s=stale):
+            self.reconcile(lane)
             while True:
                 queued = sorted((s for s in self.sessions()
                                  if s["status"] == "queued" and s.get("lane", "default") == lane),
@@ -687,20 +834,23 @@ class Gate:
         self.update(session["id"], session["head"], status="rejected", reason=reason,
                     detail=detail[-4000:], finished=time.time())
         last_line = detail.strip().splitlines()[-1] if detail.strip() else ""
-        print(f"rejected {session['id']:<24} {reason}: {last_line[:100]}", flush=True)
+        OUT.event("rejected", f"rejected {session['id']:<24} {reason}: {last_line[:100]}",
+                  session=session["id"], reason=reason, detail=last_line[:300])
 
 
 # -------------------------------------------------------------------- commands
 def cmd_init(gate: Gate, args) -> int:
     path = gate.root / CONFIG_FILE
-    if path.exists():
-        print(f"{path} already exists")
-    else:
+    created = not path.exists()
+    if created:
         path.write_text(SAMPLE_CONFIG, encoding="utf-8")
-        print(f"wrote {path}")
+        OUT.say(f"wrote {path}")
+    else:
+        OUT.say(f"{path} already exists (left unchanged)")
     git("config", "extensions.worktreeConfig", "true", cwd=gate.root)
-    print(f"next: edit test_command, commit {CONFIG_FILE} to '{gate.target}', run `gate doctor`,")
-    print(f"      and run the queue from a checkout that is not on '{gate.target}' (git switch --detach).")
+    OUT.say(f"next: edit test_command, commit {CONFIG_FILE} to '{gate.target}', run `gate doctor`,")
+    OUT.say(f"      and run the queue from a checkout that is not on '{gate.target}' (git switch --detach).")
+    OUT.result = {"config": str(path), "created": created, "target": gate.target}
     return 0
 
 
@@ -732,12 +882,20 @@ def cmd_spawn(gate: Gate, args) -> int:
         "created": time.time(),
         "sparse": args.sparse or [],
     })
-    print(worktree if worktree else f"refs/heads/{branch} @ {base}")
+    OUT.say(str(worktree) if worktree else f"refs/heads/{branch} @ {base}")
+    OUT.result = {"session": sid, "branch": branch, "worktree": str(worktree) if worktree else None,
+                  "base": base}
     return 0
 
 
 def cmd_submit(gate: Gate, args) -> int:
     session = gate.load(args.session)
+    if session["status"] in {"queued", "needs_approval"} and session.get("head") == gate.rev(session["branch"]):
+        # Idempotent: an agent that retries after a timeout gets the same answer, not an error.
+        OUT.say(f"{args.session}: already {session['status']} at {session['head'][:10]}")
+        OUT.result = {"session": args.session, "status": session["status"], "head": session["head"],
+                      "unchanged": True}
+        return 0
     if session["status"] not in {"active", "rejected", "too_large"}:
         raise GateError(f"session is {session['status']}; only active/rejected/too_large can be submitted")
     worktree = session.get("worktree")
@@ -799,19 +957,24 @@ def cmd_submit(gate: Gate, args) -> int:
             "submissions": session.get("submissions", 0) + 1,
         })
         gate.save(session)
-    print(f"{args.session}: {status} (tier {tier}, lane {session['lane']}, {sized} lines, "
-          f"{len(files)} files)" + (f" - {reason}" if reason else ""))
+    OUT.say(f"{args.session}: {status} (tier {tier}, lane {session['lane']}, {sized} lines, "
+            f"{len(files)} files)" + (f" - {reason}" if reason else ""))
     if detail:
-        print(detail)
-    return 2 if status in {"too_large", "rejected"} else 0
+        OUT.say(detail)
+    OUT.result = {"session": args.session, "status": status, "reason": reason, "head": head, "tier": tier,
+                  "lane": session["lane"], "sized_lines": sized, "files": files, "findings": findings}
+    return EXIT_POLICY if status in {"too_large", "rejected"} else 0
 
 
 def cmd_approve(gate: Gate, args) -> int:
     session = gate.load(args.session)
-    if session["status"] != "needs_approval":
+    already = session["status"] == "queued" and session.get("approved_by") == args.by
+    if session["status"] != "needs_approval" and not already:
         raise GateError(f"session is {session['status']}, not needs_approval")
-    gate.update(args.session, session["head"], status="queued", approved_by=args.by)
-    print(f"{args.session}: approved by {args.by}, queued at {session['head'][:10]}")
+    if not already:
+        gate.update(args.session, session["head"], status="queued", approved_by=args.by)
+    OUT.say(f"{args.session}: approved by {args.by}, queued at {session['head'][:10]}")
+    OUT.result = {"session": args.session, "status": "queued", "approved_by": args.by, "head": session["head"]}
     return 0
 
 
@@ -824,11 +987,19 @@ def cmd_queue(gate: Gate, args) -> int:
     if args.parallel <= 1 or len(lanes) <= 1:
         for lane in lanes:
             gate.drain_lane(lane, args.drain, args.wait)
-        return 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as pool:
-        futures = [pool.submit(gate.drain_lane, lane, args.drain, args.wait) for lane in lanes]
-        for future in futures:
-            future.result()
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as pool:
+            futures = [pool.submit(gate.drain_lane, lane, args.drain, args.wait) for lane in lanes]
+            for future in futures:
+                future.result()
+    if not lanes:
+        OUT.say("queue: nothing queued")
+    by_kind: dict[str, list] = {"merged": [], "rejected": [], "recovered": []}
+    for event in OUT.events:
+        if event["event"] in by_kind:
+            by_kind[event["event"]].append({k: v for k, v in event.items() if k != "event"})
+    remaining = sum(1 for s in gate.sessions() if s["status"] == "queued")
+    OUT.result = {"lanes": lanes, **by_kind, "still_queued": remaining}
     return 0
 
 
@@ -838,17 +1009,20 @@ def cmd_verify(gate: Gate, args) -> int:
         tip = gate.sync_tip()
         state = gate.read_json("verify.json", {})
         last_green = state.get("last_green")
+        OUT.result = {"target": gate.target, "tip": tip, "last_green": last_green}
         ok, log = gate.run_tests(tip, None)
         if ok:
             gate.write_json(gate.state / "verify.json", {"last_green": tip, "checked": time.time()})
-            print(f"green    {gate.target} @ {tip[:10]}")
+            OUT.say(f"green    {gate.target} @ {tip[:10]}")
+            OUT.result["status"] = "green"
             return 0
-        print(f"red      {gate.target} @ {tip[:10]}")
+        OUT.say(f"red      {gate.target} @ {tip[:10]}")
+        OUT.result.update(status="red", log=log[-1500:])
         if not last_green or git_run("merge-base", "--is-ancestor", last_green, tip,
                                      cwd=gate.root).returncode != 0:
-            print("no known-green baseline to bisect from; fix manually, then run verify again")
-            print(log[-1500:])
-            return 3
+            OUT.say("no known-green baseline to bisect from; fix manually, then run verify again")
+            OUT.say(log[-1500:])
+            return EXIT_NEEDS_HUMAN
         commits = git("rev-list", "--reverse", "--first-parent", f"{last_green}..{tip}",
                       cwd=gate.root).split()
         low, high = 0, len(commits) - 1
@@ -862,14 +1036,15 @@ def cmd_verify(gate: Gate, args) -> int:
         sid = git("log", "-1", "--format=%(trailers:key=Agent-Session,valueonly)", culprit,
                   cwd=gate.root).strip()
         title = git("log", "-1", "--format=%s", culprit, cwd=gate.root).strip()
-        print(f"culprit  {culprit[:10]} {title!r}" + (f" (session {sid})" if sid else " (not from gate)"))
+        OUT.say(f"culprit  {culprit[:10]} {title!r}" + (f" (session {sid})" if sid else " (not from gate)"))
+        OUT.result.update(culprit=culprit, culprit_session=sid or None, culprit_title=title)
         if not sid or args.no_revert:
-            return 3
+            return EXIT_NEEDS_HUMAN
         proc = git_run("merge-tree", "--write-tree", f"--merge-base={culprit}", tip, f"{culprit}^",
                        cwd=gate.root)
         if proc.returncode != 0:
-            print("automatic revert conflicts with later commits; revert manually")
-            return 3
+            OUT.say("automatic revert conflicts with later commits; revert manually")
+            return EXIT_NEEDS_HUMAN
         message = (f'Revert "{title}"\n\nPost-merge verification failed on {gate.target} @ {tip[:12]};\n'
                    f"bisected to this agent change.\n\nReverts: {culprit}\nAgent-Session: {sid}\n")
         env = {**os.environ, "GIT_AUTHOR_NAME": "gate", "GIT_AUTHOR_EMAIL": "gate@localhost",
@@ -877,17 +1052,18 @@ def cmd_verify(gate: Gate, args) -> int:
         revert = git("commit-tree", proc.stdout.split()[0], "-p", tip, "-m", message,
                      cwd=gate.root, env=env).strip()
         if not gate.run_tests(revert, None)[0]:
-            print("revert did not restore green; leaving target unchanged")
-            return 3
+            OUT.say("revert did not restore green; leaving target unchanged")
+            return EXIT_NEEDS_HUMAN
         published = gate.publish(tip, [revert], gate.changed_files(tip, revert))
         if published is None:
-            print(f"{gate.target} moved during verification; run verify again")
-            return 4
+            OUT.say(f"{gate.target} moved during verification; run verify again")
+            return EXIT_TARGET_MOVED
         with contextlib.suppress(GateError):
             gate.update(sid, status="reverted", reason="post-merge verification failed",
                         detail=log, reverted_by=published[-1], finished=time.time())
         gate.write_json(gate.state / "verify.json", {"last_green": published[-1], "checked": time.time()})
-        print(f"reverted {sid} with {published[-1][:10]}; {gate.target} is green again")
+        OUT.say(f"reverted {sid} with {published[-1][:10]}; {gate.target} is green again")
+        OUT.result.update(status="reverted", revert_commit=published[-1])
         return 0
 
 
@@ -899,7 +1075,8 @@ def cmd_abandon(gate: Gate, args) -> int:
     gate.cleanup(session)
     gate.update(args.session, status="abandoned", finished=time.time(),
                 reason=session.get("reason") or "abandoned")
-    print(f"{args.session}: abandoned, diff archived to {path}")
+    OUT.say(f"{args.session}: abandoned, diff archived to {path}")
+    OUT.result = {"session": args.session, "status": "abandoned", "archive": str(path)}
     return 0
 
 
@@ -914,15 +1091,17 @@ def cmd_trace(gate: Gate, args) -> int:
     path = gate.state / "traces" / f"{args.session}.jsonl.gz"
     with gzip.open(path, "wb") as handle:
         handle.write(data)
-    gate.update(args.session, trace={
+    record = {
         "sha256": hashlib.sha256(data).hexdigest(),
         "raw_bytes": len(data),
         "stored_bytes": path.stat().st_size,
         "redactions": redactions,
         "stored": time.time(),
-    })
-    print(f"{args.session}: trace stored ({len(data)} B -> {path.stat().st_size} B gz, "
-          f"{redactions} redactions)")
+    }
+    gate.update(args.session, trace=record)
+    OUT.say(f"{args.session}: trace stored ({len(data)} B -> {path.stat().st_size} B gz, "
+            f"{redactions} redactions)")
+    OUT.result = {"session": args.session, **record}
     return 0
 
 
@@ -930,7 +1109,15 @@ def cmd_gc(gate: Gate, args) -> int:
     retention = gate.config["retention"]
     now = time.time()
     archived = traces_deleted = attempts_deleted = 0
+    recovered = gate.reconcile()
+    branches_cleaned = 0
     for session in gate.sessions():
+        if session["status"] in {"merged", "abandoned"}:
+            ref = f"refs/heads/{session['branch']}"
+            leftover = git_run("rev-parse", "--verify", "--quiet", ref, cwd=gate.root).returncode == 0
+            if leftover or (session.get("worktree") and Path(session["worktree"]).exists()):
+                gate.cleanup(session)  # a crash between recording the result and cleaning up
+                branches_cleaned += 1
         finished = session.get("finished") or session["created"]
         grace = retention["reject_grace_hours"] * 3600
         if session["status"] == "rejected" and now - finished >= grace:
@@ -952,8 +1139,11 @@ def cmd_gc(gate: Gate, args) -> int:
             path.unlink()
             attempts_deleted += 1
     git_run("worktree", "prune", cwd=gate.root)
-    print(f"gc: archived {archived} rejected sessions, deleted {traces_deleted} traces, "
-          f"{attempts_deleted} attempt archives")
+    OUT.say(f"gc: archived {archived} rejected sessions, deleted {traces_deleted} traces, "
+            f"{attempts_deleted} attempt archives, cleaned {branches_cleaned} leftover branches, "
+            f"recovered {len(recovered)} interrupted merges")
+    OUT.result = {"archived": archived, "traces_deleted": traces_deleted, "attempts_deleted": attempts_deleted,
+                  "branches_cleaned": branches_cleaned, "recovered": recovered}
     return 0
 
 
@@ -963,24 +1153,32 @@ def cmd_status(gate: Gate, args) -> int:
         rows = [s for s in rows if s["status"] in IN_FLIGHT | {"reverted"}]
     order = {"needs_approval": 0, "reverted": 1, "too_large": 2, "rejected": 3, "queued": 4, "active": 5}
     rows.sort(key=lambda s: (order.get(s["status"], 9), s.get("submitted") or s["created"]))
-    print(f"{'SESSION':<24} {'STATUS':<15} {'TIER':>4} {'LANE':<10} {'LINES':>6} {'FILES':>5}  "
-          f"{'MODEL':<18} REASON")
+    OUT.say(f"{'SESSION':<24} {'STATUS':<15} {'TIER':>4} {'LANE':<10} {'LINES':>6} {'FILES':>5}  "
+            f"{'MODEL':<18} REASON")
     for s in rows:
-        print(f"{s['id']:<24} {s['status']:<15} {s.get('tier', '-')!s:>4} {s.get('lane', '-'):<10} "
-              f"{s.get('sized_lines', '-')!s:>6} {len(s.get('files', [])):>5}  "
-              f"{(s.get('model') or '-'):<18} {s.get('reason') or ''}")
+        OUT.say(f"{s['id']:<24} {s['status']:<15} {s.get('tier', '-')!s:>4} {s.get('lane', '-'):<10} "
+                f"{s.get('sized_lines', '-')!s:>6} {len(s.get('files', [])):>5}  "
+                f"{(s.get('model') or '-'):<18} {s.get('reason') or ''}")
+    fields = ("id", "status", "reason", "tier", "lane", "sized_lines", "model", "head", "branch", "worktree",
+              "submitted", "finished", "merged_commit")
+    OUT.result = {"sessions": [{key: s.get(key) for key in fields} for s in rows]}
     return 0
 
 
 def cmd_show(gate: Gate, args) -> int:
     session = gate.load(args.session)
-    print(json.dumps({k: v for k, v in session.items() if k != "detail"}, indent=2))
+    OUT.result = {"session": session}
+    OUT.say(json.dumps({k: v for k, v in session.items() if k != "detail"}, indent=2))
     if session.get("detail"):
-        print("\n--- detail ---\n" + session["detail"])
+        OUT.say("\n--- detail ---\n" + session["detail"])
     if session.get("head"):
-        print(git("diff", "--stat", session["base"], session["head"], cwd=gate.root))
+        diffstat = git("diff", "--stat", session["base"], session["head"], cwd=gate.root)
+        OUT.say(diffstat)
+        OUT.result["diffstat"] = diffstat
         if args.patch:
-            print(git("diff", session["base"], session["head"], cwd=gate.root))
+            patch = git("diff", session["base"], session["head"], cwd=gate.root)
+            OUT.say(patch)
+            OUT.result["patch"] = patch
     return 0
 
 
@@ -1011,37 +1209,50 @@ def cmd_stats(gate: Gate, args) -> int:
                         cwd=gate.root).splitlines())
     attempt_bytes = sum(p.stat().st_size for p in (gate.state / "attempts").glob("*"))
     trace_bytes = sum(p.stat().st_size for p in (gate.state / "traces").glob("*"))
-    print("sessions by status:  " + ", ".join(f"{k}={v}" for k, v in sorted(by_status.items())))
-    print("not-merged reasons:  " + (", ".join(f"{k}={v}" for k, v in sorted(reasons.items())) or "-"))
+    OUT.say("sessions by status:  " + ", ".join(f"{k}={v}" for k, v in sorted(by_status.items())))
+    OUT.say("not-merged reasons:  " + (", ".join(f"{k}={v}" for k, v in sorted(reasons.items())) or "-"))
     for name, counts in sorted(by_model.items()):
         total = counts["merged"] + counts["not_merged"]
         rate = f"{100 * counts['merged'] / total:.0f}%" if total else "-"
-        print(f"model {name:<18} merged {counts['merged']:>4} / {total:<4} ({rate})")
+        OUT.say(f"model {name:<18} merged {counts['merged']:>4} / {total:<4} ({rate})")
     merged = by_status.get("merged", 0)
     if ci_runs:
-        print(f"CI runs: {ci_runs}  (merged sessions per CI run: {merged / ci_runs:.2f})")
+        OUT.say(f"CI runs: {ci_runs}  (merged sessions per CI run: {merged / ci_runs:.2f})")
     else:
-        print("CI runs: 0")
-    print(f"suite runs: {counters.get('suite_runs', 0)}  suite cache hits: {counters.get('suite_cache_hits', 0)}")
+        OUT.say("CI runs: 0")
+    OUT.say(f"suite runs: {counters.get('suite_runs', 0)}  suite cache hits: {counters.get('suite_cache_hits', 0)}")
     publishes = counters.get("publishes", 0)
     if publishes:
-        print(f"publishes: {publishes}  commuted without re-test: {counters.get('commuted_publishes', 0)}  "
+        OUT.say(f"publishes: {publishes}  commuted without re-test: {counters.get('commuted_publishes', 0)}  "
               f"mean lock hold: {counters.get('publish_hold_ms', 0) / publishes:.0f} ms  "
               f"(incl. wait: {counters.get('publish_ms', 0) / publishes:.0f} ms)")
     if latencies:
-        print(f"submit->merge median: {statistics.median(latencies):.1f} min")
-    print(f"live agent branches: {live_refs}   attempt archives: {attempt_bytes} B   traces: {trace_bytes} B")
+        OUT.say(f"submit->merge median: {statistics.median(latencies):.1f} min")
+    OUT.say(f"live agent branches: {live_refs}   attempt archives: {attempt_bytes} B   traces: {trace_bytes} B")
+    OUT.result = {
+        "by_status": by_status,
+        "not_merged_reasons": reasons,
+        "by_model": by_model,
+        "counters": counters,
+        "merged_per_ci_run": merged / ci_runs if ci_runs else None,
+        "submit_to_merge_median_min": statistics.median(latencies) if latencies else None,
+        "live_agent_branches": live_refs,
+        "attempt_bytes": attempt_bytes,
+        "trace_bytes": trace_bytes,
+    }
     return 0
 
 
 def cmd_doctor(gate: Gate, args) -> int:
     failures = 0
+    checks: list[dict] = []
 
     def report(ok: bool | None, name: str, detail: str = "") -> None:
         nonlocal failures
         mark = {True: "ok  ", False: "FAIL", None: "warn"}[ok]
         failures += ok is False
-        print(f"[{mark}] {name}" + (f" - {detail}" if detail else ""))
+        checks.append({"check": name, "status": mark.strip().lower(), "detail": detail})
+        OUT.say(f"[{mark}] {name}" + (f" - {detail}" if detail else ""))
 
     version = git_version()
     report(version >= MIN_GIT, "git version", f"{version[0]}.{version[1]} (need >= {MIN_GIT[0]}.{MIN_GIT[1]})")
@@ -1075,62 +1286,105 @@ def cmd_doctor(gate: Gate, args) -> int:
             report(pushed.returncode == 0 and deleted.returncode == 0, "push access",
                    "push access ok (scratch ref created and deleted)" if pushed.returncode == 0
                    else pushed.stderr.strip()[-300:])
-            print("       note: branch protection on the target itself is only exercised by a real publish;")
-            print("       give the gate's bot a ruleset bypass for the target branch.")
-    print("doctor: " + ("all checks passed" if not failures else f"{failures} failing check(s)"))
-    return 0 if not failures else 1
+            OUT.say("       note: branch protection on the target itself is only exercised by a real publish;")
+            OUT.say("       give the gate's bot a ruleset bypass for the target branch.")
+    OUT.say("doctor: " + ("all checks passed" if not failures else f"{failures} failing check(s)"))
+    OUT.result = {"checks": checks, "failures": failures}
+    return 0 if not failures else EXIT_ERROR
+
+
+HELP_EPILOG = """\
+workflow (one agent session):
+  gate spawn S1                      branch + worktree from the target tip; prints the worktree path
+  ...agent commits in that worktree (or pushes refs/heads/agent/S1 with --no-worktree)...
+  gate submit S1 --model <id>        policy checks; status queued | needs_approval | too_large | rejected
+  gate queue --drain                 merge, test and publish everything queued (run by one gate process)
+  gate verify                        post-merge check of the target; bisects and reverts a regression
+
+automation: add --json before the subcommand for one JSON document on stdout:
+  {"command": ..., "exit_code": ..., "result": {...}, "events": [...]}   or   {"error": ...}
+
+exit codes:
+  0  ok
+  1  error (usage, git, environment; doctor found a failing check)
+  2  submit bounced by policy (too large, or secrets on added lines)
+  3  verify: target is red and needs a human (no baseline, revert conflicts, or --no-revert)
+  4  verify: target moved during the revert; run verify again
+"""
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="gate", description=__doc__.split("\n\n")[0])
-    parser.add_argument("-C", dest="repo", default=".", help="repository path (default: cwd)")
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser = argparse.ArgumentParser(
+        prog="gate",
+        description=__doc__.split("\n\n")[0] if __doc__ else "gate",
+        epilog=HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("-C", dest="repo", default=".", metavar="PATH", help="repository path (default: cwd)")
+    parser.add_argument("--json", action="store_true",
+                        help="print one machine-readable JSON document instead of text")
+    parser.add_argument("--version", action="version", version=f"gate {__version__}")
+    sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
-    sub.add_parser("init", help="write a sample gate.toml")
+    sub.add_parser("init", help="write a sample gate.toml and enable per-worktree config",
+                   description="Write a commented sample gate.toml in the repository root (never overwrites).")
 
-    spawn = sub.add_parser("spawn", help="create a branch (+ worktree) for an agent session")
-    spawn.add_argument("session")
-    spawn.add_argument("--sparse", nargs="+", metavar="DIR", help="sparse cone directories")
+    spawn = sub.add_parser("spawn", help="create a branch (+ worktree) for an agent session",
+                           description="Create refs/heads/agent/<session> at the target tip, plus a worktree "
+                                       "next to the repository unless --no-worktree.")
+    spawn.add_argument("session", help="session id: letters, digits, . _ - (max 64)")
+    spawn.add_argument("--sparse", nargs="+", metavar="DIR", help="sparse-checkout cone directories")
     spawn.add_argument("--no-worktree", action="store_true",
                        help="branch only; the agent runs elsewhere and pushes refs/heads/agent/<id>")
 
-    submit = sub.add_parser("submit", help="submit a session's commits to the gate")
-    submit.add_argument("session")
-    submit.add_argument("--model", required=True, help="exact model id")
+    submit = sub.add_parser("submit", help="submit a session's commits to the gate",
+                            description="Run policy checks (secrets, size, risk tier) and queue the session. "
+                                        "Re-submitting an unchanged queued session is a no-op. Exit 2 if bounced.")
+    submit.add_argument("session", help="session id")
+    submit.add_argument("--model", required=True, help="exact model id (recorded as a commit trailer)")
     submit.add_argument("--tool", help="agent tool and version")
     submit.add_argument("--spec", help="spec/issue reference")
     submit.add_argument("--prompt-file", help="prompt file (only its SHA-256 is recorded)")
     submit.add_argument("--title", help="commit title (default: last commit subject)")
 
-    approve = sub.add_parser("approve", help="human approval for a high-risk session")
-    approve.add_argument("session")
-    approve.add_argument("--by", required=True)
+    approve = sub.add_parser("approve", help="human approval for a high-risk session",
+                             description="Queue a needs_approval session; the approver is recorded as a trailer.")
+    approve.add_argument("session", help="session id")
+    approve.add_argument("--by", required=True, help="approver name or handle")
 
-    queue = sub.add_parser("queue", help="merge, test and publish queued sessions")
+    queue = sub.add_parser("queue", help="merge, test and publish queued sessions",
+                           description="Process queued sessions lane by lane: merge-tree, test (batched, "
+                                       "bisected on failure), compare-and-swap publish. Also recovers merges "
+                                       "published by an interrupted run.")
     queue.add_argument("--drain", action="store_true", help="process until the queue is empty")
-    queue.add_argument("--parallel", type=int, default=1, help="lanes processed concurrently")
+    queue.add_argument("--parallel", type=int, default=1, help="lanes processed concurrently (default 1)")
     queue.add_argument("--lane", action="append", help="only these lanes (repeatable)")
-    queue.add_argument("--wait", type=float, default=5.0, help="seconds to wait for a lane lock")
+    queue.add_argument("--wait", type=float, default=5.0, help="seconds to wait for a lane lock (default 5)")
 
-    verify = sub.add_parser("verify", help="test the target; bisect and auto-revert a regression")
+    verify = sub.add_parser("verify", help="test the target; bisect and auto-revert a regression",
+                            description="Run all suites on the target tip. If red, bisect commits since the last "
+                                        "green tip and revert the culprit if it came from gate. Exit 3/4, see below.",
+                            epilog=HELP_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
     verify.add_argument("--no-revert", action="store_true", help="report the culprit only")
-    verify.add_argument("--wait", type=float, default=5.0)
+    verify.add_argument("--wait", type=float, default=5.0, help="seconds to wait for the verify lock")
 
     abandon = sub.add_parser("abandon", help="archive a session's diff and delete its branch")
-    abandon.add_argument("session")
+    abandon.add_argument("session", help="session id")
 
-    trace = sub.add_parser("trace", help="store a redacted, compressed agent trace")
-    trace.add_argument("session")
-    trace.add_argument("file")
+    trace = sub.add_parser("trace", help="store a redacted, compressed agent trace",
+                           description="Redact secrets from an agent trace, gzip it under .git/gate/traces and "
+                                       "record its SHA-256 (added to the commit as Trace-SHA256).")
+    trace.add_argument("session", help="session id")
+    trace.add_argument("file", help="trace file (any text, e.g. JSONL)")
 
-    sub.add_parser("gc", help="apply retention policy")
+    sub.add_parser("gc", help="apply retention; finish cleanup interrupted by a crash")
 
     status = sub.add_parser("status", help="in-flight sessions, review items first")
-    status.add_argument("--all", action="store_true")
+    status.add_argument("--all", action="store_true", help="include merged and abandoned sessions")
 
     show = sub.add_parser("show", help="session details and diffstat")
-    show.add_argument("session")
-    show.add_argument("--patch", action="store_true")
+    show.add_argument("session", help="session id")
+    show.add_argument("--patch", action="store_true", help="include the full diff")
 
     sub.add_parser("stats", help="throughput, merge rate by model, retention footprint")
 
@@ -1159,12 +1413,21 @@ COMMANDS = {
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    OUT.reset(json_mode=args.json)
     try:
         gate = Gate(Path(args.repo).resolve())
-        return COMMANDS[args.command](gate, args)
+        code = COMMANDS[args.command](gate, args)
     except GateError as error:
-        print(f"gate: {error}", file=sys.stderr)
-        return 1
+        if args.json:
+            print(json.dumps({"command": args.command, "exit_code": EXIT_ERROR, "error": str(error),
+                              "events": OUT.events}))
+        else:
+            print(f"gate: {error}", file=sys.stderr)
+        return EXIT_ERROR
+    if args.json:
+        print(json.dumps({"command": args.command, "exit_code": code, "result": OUT.result,
+                          "events": OUT.events}, default=str))
+    return code
 
 
 if __name__ == "__main__":

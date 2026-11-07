@@ -11,6 +11,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -530,6 +532,171 @@ class GateTest(unittest.TestCase):
         self.assertIn("push access ok", out)
         refs = run_git("--git-dir", str(self.origin), "for-each-ref", "refs/heads/", cwd=self.tmp)
         self.assertNotIn("gate-doctor", refs)
+
+    # ------------------------------------------------------------ crash safety
+    def test_crash_after_publish_is_recovered_without_duplicates(self):
+        """A process killed between publishing and recording the merge must not land work twice."""
+        self.make_repo()
+        for n in (1, 2):
+            self.assertEqual(self.agent(f"c{n}", self.feature(n))[0], 0)
+        real_update = gate.Gate.update
+
+        def crash_on_merge(instance, sid, expected_head=None, **changes):
+            if changes.get("status") == "merged":
+                raise KeyboardInterrupt("simulated kill after publish")
+            return real_update(instance, sid, expected_head, **changes)
+
+        with mock.patch.object(gate.Gate, "update", crash_on_merge), self.assertRaises(KeyboardInterrupt):
+            self.gate("queue", "--drain")
+        self.assertEqual(self.session("c1")["status"], "queued")  # published, but not recorded
+        published = run_git("log", "--format=%H", "main", cwd=self.repo).split()
+
+        code, out = self.gate("--json", "queue", "--drain")
+        self.assertEqual(code, 0, out)
+        doc = json.loads(out)
+        self.assertEqual(sorted(item["session"] for item in doc["result"]["recovered"]), ["c1", "c2"])
+        self.assertEqual(doc["result"]["merged"], [])
+        self.assertEqual(run_git("log", "--format=%H", "main", cwd=self.repo).split(), published)
+        log = self.main_log()
+        for n in (1, 2):
+            self.assertEqual(log.count(f"Agent-Session: c{n}\n"), 1)
+            session = self.session(f"c{n}")
+            self.assertEqual(session["status"], "merged")
+            self.assertTrue(session["recovered"])
+        self.assertEqual(run_git("for-each-ref", "refs/heads/agent/", cwd=self.repo), "")
+
+    def test_gc_finishes_cleanup_interrupted_after_merge(self):
+        self.make_repo()
+        self.assertEqual(self.agent("g1", self.feature(1))[0], 0)
+        with mock.patch.object(gate.Gate, "cleanup"):
+            self.assertEqual(self.gate("queue")[0], 0)
+        self.assertEqual(self.session("g1")["status"], "merged")
+        self.assertIn("agent/g1", run_git("for-each-ref", "refs/heads/agent/", cwd=self.repo))
+        code, out = self.gate("--json", "gc")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(json.loads(out)["result"]["branches_cleaned"], 1)
+        self.assertEqual(run_git("for-each-ref", "refs/heads/agent/", cwd=self.repo), "")
+
+    def test_lock_left_by_dead_process_is_taken_over(self):
+        self.make_repo()
+        state = self.repo / ".git" / "gate"
+        state.mkdir(parents=True, exist_ok=True)
+        dead_pid = 2 ** 22 + 12345  # far above any live pid on CI runners
+        (state / "lane-default.lock").write_text(f"{dead_pid} {gate.socket.gethostname()}")
+        self.assertEqual(self.agent("d1", self.feature(1))[0], 0)
+        code, out = self.gate("queue", "--wait", "0.2")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.session("d1")["status"], "merged")
+        self.assertFalse((state / "lane-default.lock").exists())
+
+    def test_stale_lock_takeover_is_exclusive_under_contention(self):
+        """Many contenders breaking the same dead lock must still enter one at a time."""
+        self.make_repo()
+        instance = gate.Gate(self.repo)
+        dead = f"{2 ** 22 + 12345} {gate.socket.gethostname()}"
+        intervals: list[tuple[float, float]] = []
+        record = threading.Lock()
+
+        def contender() -> None:
+            with instance.lock("contended", timeout_s=30):
+                entered = time.perf_counter()
+                time.sleep(0.02)
+                left = time.perf_counter()
+            with record:
+                intervals.append((entered, left))
+
+        for _ in range(3):
+            (instance.state / "contended.lock").write_text(dead)
+            threads = [threading.Thread(target=contender) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        intervals.sort()
+        self.assertEqual(len(intervals), 24)
+        for (_, left), (entered, _) in zip(intervals, intervals[1:], strict=False):
+            self.assertLessEqual(left, entered)
+
+    def test_lock_held_by_live_or_remote_owner_blocks(self):
+        self.make_repo()
+        state = self.repo / ".git" / "gate"
+        state.mkdir(parents=True, exist_ok=True)
+        self.assertEqual(self.agent("l1", self.feature(1))[0], 0)
+        lock = state / "lane-default.lock"
+        for owner in (f"{os.getpid()} {gate.socket.gethostname()}", "4242 some-other-host"):
+            lock.write_text(owner)
+            code, out = self.gate("--json", "queue", "--wait", "0.2")
+            self.assertEqual(code, gate.EXIT_ERROR, out)
+            self.assertIn("lock is held", json.loads(out)["error"])
+            self.assertEqual(self.session("l1")["status"], "queued")
+        lock.unlink()
+
+    def test_pid_alive(self):
+        self.assertTrue(gate.pid_alive(os.getpid()))
+        self.assertFalse(gate.pid_alive(0))
+        self.assertFalse(gate.pid_alive(2 ** 22 + 12345))
+
+    # ------------------------------------------------------------ automation interface
+    def test_json_output_and_idempotent_submit(self):
+        self.make_repo()
+        code, out = self.gate("--json", "spawn", "j1")
+        self.assertEqual(code, 0, out)
+        spawned = json.loads(out)["result"]
+        self.assertEqual(spawned["branch"], "agent/j1")
+        self.commit(Path(spawned["worktree"]), self.feature(1), "j1: change")
+
+        code, out = self.gate("--json", "submit", "j1", "--model", "m")
+        doc = json.loads(out)
+        self.assertEqual((code, doc["exit_code"], doc["result"]["status"]), (0, 0, "queued"))
+        code, out = self.gate("--json", "submit", "j1", "--model", "m")  # agent retry after a timeout
+        self.assertEqual(code, 0, out)
+        self.assertTrue(json.loads(out)["result"]["unchanged"])
+
+        code, out = self.gate("--json", "status")
+        self.assertEqual([s["id"] for s in json.loads(out)["result"]["sessions"]], ["j1"])
+        code, out = self.gate("--json", "queue")
+        doc = json.loads(out)
+        self.assertEqual([m["session"] for m in doc["result"]["merged"]], ["j1"])
+        self.assertEqual(doc["events"][0]["event"], "merged")
+        code, out = self.gate("--json", "stats")
+        self.assertEqual(json.loads(out)["result"]["by_status"], {"merged": 1})
+        code, out = self.gate("--json", "show", "j1")
+        self.assertEqual(json.loads(out)["result"]["session"]["status"], "merged")
+        code, out = self.gate("--json", "verify")
+        self.assertEqual(json.loads(out)["result"]["status"], "green")
+        code, out = self.gate("--json", "doctor")
+        self.assertEqual(json.loads(out)["result"]["failures"], 0)
+
+    def test_json_errors_and_policy_exit_code(self):
+        self.make_repo()
+        code, out = self.gate("--json", "show", "nope")
+        self.assertEqual(code, gate.EXIT_ERROR)
+        self.assertIn("unknown session", json.loads(out)["error"])
+        big = {"lib/big.py": "".join(f"x{i} = {i}\n" for i in range(500))}
+        worktree = self.spawn("big")
+        self.commit(worktree, big, "big change")
+        code, out = self.gate("--json", "submit", "big", "--model", "m")
+        self.assertEqual(code, gate.EXIT_POLICY)
+        self.assertEqual(json.loads(out)["result"]["status"], "too_large")
+
+    def test_version_and_help(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            gate.main(["--version"])
+        self.assertIn(gate.__version__, out.getvalue())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            gate.main(["--help"])
+        self.assertIn("exit codes:", out.getvalue())
+        self.assertIn("--json", out.getvalue())
+
+    def test_init_is_idempotent(self):
+        self.make_repo()
+        (self.repo / "gate.toml").unlink()
+        code, out = self.gate("--json", "init")
+        self.assertTrue(json.loads(out)["result"]["created"])
+        code, out = self.gate("--json", "init")
+        self.assertFalse(json.loads(out)["result"]["created"])
 
 
 if __name__ == "__main__":
