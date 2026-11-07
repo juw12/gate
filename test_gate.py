@@ -1060,6 +1060,23 @@ class GateTest(unittest.TestCase):
         self.assertEqual(code, gate.EXIT_ERROR, out)
         self.assertIn("max_batch", out)
 
+    def test_policy_typos_and_duplicate_suite_names_are_rejected(self):
+        # A misspelled key would silently leave its default in force (e.g. no test command at all).
+        self.make_repo(append="test_comand = 'pytest'\n")
+        code, out = self.gate("status")
+        self.assertEqual(code, gate.EXIT_ERROR, out)
+        self.assertIn("test_comand", out)
+
+        # Two suites with one name would share a test-cache key, so one could be skipped on the other's pass.
+        duplicate = ("\n[[tests]]\nname = 'api'\ncommand = 'a'\n"
+                     "\n[[tests]]\nname = 'api'\ncommand = 'b'\n")
+        fixed = self.main_file("gate.toml").replace("test_comand = 'pytest'\n", "")
+        self.commit_on_main({"gate.toml": fixed + duplicate}, "two suites named api")
+        code, out = self.gate("status")
+        self.assertEqual(code, gate.EXIT_ERROR, out)
+        self.assertIn("api", out)
+        self.assertIn("more than once", out)
+
     def test_provenance_fields_cannot_forge_trailers(self):
         self.make_repo()
         victim = self.spawn("victim")

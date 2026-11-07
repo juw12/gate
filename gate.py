@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import contextlib
+import difflib
 import fnmatch
 import gzip
 import hashlib
@@ -405,6 +406,16 @@ def _string_list_problem(name: str, value: Any) -> str | None:
 
 def config_problem(config: dict) -> str | None:
     """First thing wrong with a merged config, phrased for the human who has to fix it; None if valid."""
+    # Unknown keys are refused: a typo such as `test_comand` would otherwise leave the default (no tests) in force.
+    for key in config:
+        if key not in DEFAULT_CONFIG:
+            close = difflib.get_close_matches(key, DEFAULT_CONFIG, n=1)
+            return f"unknown key {key!r}" + (f" (did you mean {close[0]!r}?)" if close else "")
+    for table in ("risk", "retention"):
+        if isinstance(config[table], dict):
+            for key in config[table]:
+                if key not in DEFAULT_CONFIG[table]:  # type: ignore[operator]
+                    return f"unknown key {table}.{key}"
     for key, default in DEFAULT_CONFIG.items():
         expected: type | tuple[type, ...] = (int, float) if isinstance(default, (int, float)) and not \
             isinstance(default, bool) else type(default)
@@ -425,6 +436,13 @@ def config_problem(config: dict) -> str | None:
     for key, value in config["retention"].items():
         if not _is(value, (int, float)):
             return f"retention.{key} must be a number, not {value!r}"
+    names = ["default"] if config["test_command"] else []
+    for index, suite in enumerate(config["tests"]):
+        names.append(suite.get("name") or f"suite{index}" if isinstance(suite, dict) else f"suite{index}")
+    repeated = sorted({name for name in names if names.count(name) > 1})
+    if repeated:
+        # Suite names key the pass cache; a shared name would let one suite's pass skip the other.
+        return f"test suite name {repeated[0]!r} is used more than once (test_command is named 'default')"
     for index, suite in enumerate(config["tests"]):
         where = f"[[tests]] entry {index + 1}" + (f" ({suite.get('name')})" if isinstance(suite, dict)
                                                   and suite.get("name") else "")

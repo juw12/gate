@@ -161,9 +161,9 @@ that is checked out in any worktree, whether in `queue`, a remote fetch or a `ve
 
 ## Measured
 
-Unit/e2e: `python -m unittest -v test_gate`, 59 tests on real repos (real-process kills, skewed and silent
-locks, contended locks, protected remote, JSON interface, remote races, verify/revert, secrets, malformed
-policy, forged trailers, clean UTF-8 docs).
+Unit/e2e: `python -m unittest -v test_gate`, 60 tests on real repos (real-process kills, skewed and silent
+locks, contended locks, protected remote, JSON interface, remote races, verify/revert, secrets, malformed or
+misspelled policy, forged trailers, clean UTF-8 docs).
 CI runs them on Linux, macOS and Windows x Python 3.11/3.13 and also enforces `ruff`, `mypy` and ≥ 85 % line
 coverage of `gate.py` (92 % at 0.4.0). The `nfs` workflow runs the two-host NFS test on every change to `gate.py`.
 

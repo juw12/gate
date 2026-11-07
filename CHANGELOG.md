@@ -18,6 +18,10 @@ Every finding of the round-2 review was checked in the code first; all were real
 - **verify and merge commits.** A merge commit on the target that carried an `Agent-Session` trailer could be
   picked as the culprit and auto-reverted against its first parent, undoing a whole branch. verify now stops
   with exit 3 for any merge-commit culprit.
+- **Misspelled policy keys.** An unknown key (for example `test_comand`) was ignored, so the default stayed in
+  force, which for `test_command` means merging untested. Unknown keys are now refused, with a suggestion.
+- **Duplicate suite names.** Two `[[tests]]` suites with one name shared a pass-cache key, so one suite's pass
+  could skip the other. Duplicate names (including `default`, the name of `test_command`) are refused.
 - **Kill while testing.** The crash-safety row "killed while testing a batch" is now proven with a real process
   kill between the green test run and publication (`GATE_FAULT=after-tests`): nothing is published, the next
   run re-lands the batch once.
