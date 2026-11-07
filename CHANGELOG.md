@@ -3,6 +3,23 @@
 All notable changes. Versions follow [semantic versioning](https://semver.org/); the JSON output and exit
 codes are part of the public interface.
 
+## [0.3.0] - 2026-11-07
+
+### Added
+- Heartbeat locks: holders refresh their lock every 5 s; a lock silent for 60 s is taken over. This also covers
+  reused pids, frozen processes and owners on other hosts sharing the repository. A holder never deletes a lock
+  that no longer carries its token.
+- `gate init` detects the test command (pytest, npm, go, cargo, unittest) and says why.
+- `examples/agent_loop.py`: reference agent client using only `--json`, exercised by the test suite.
+- `e2e_github.py` and a weekly/on-demand `e2e` workflow: batch, crash-after-push recovery and concurrent-push
+  scenarios against a real GitHub remote on a throwaway branch.
+- Error messages say what to do next (unknown session, nothing committed, dirty worktree).
+- mypy now runs with `disallow_untyped_defs`.
+
+### Fixed
+- In remote mode the policy was read before fetching, so a `gate.toml` change pushed to the remote applied one run
+  late. A fetch that moves the target now reloads the policy, and `submit` fetches first.
+
 ## [0.2.0] - 2026-11-07
 
 ### Added

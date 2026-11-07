@@ -41,11 +41,15 @@ import threading
 import time
 import tomllib
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 CONFIG_FILE = "gate.toml"
+LOCK_HEARTBEAT_S = 5.0   # a lock holder touches its lock file this often
+LOCK_STALE_S = 60.0      # a lock untouched this long is abandoned (owner dead, frozen or gone)
 MIN_GIT = (2, 40)
 SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 IN_FLIGHT = {"active", "too_large", "needs_approval", "queued", "rejected"}
@@ -220,6 +224,32 @@ def secrets_in_diff(diff: str, exempt: list[str]) -> list[str]:
     return sorted(set(findings))
 
 
+# ------------------------------------------------------------------ init
+def detect_test_command(root: Path) -> tuple[str, str]:
+    """Best guess at a repository's test command, with the evidence for it ('' if none found)."""
+    def read(name: str) -> str:
+        path = root / name
+        return path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+
+    if (root / "pytest.ini").is_file() or any("pytest" in read(f) for f in
+                                              ("pyproject.toml", "setup.cfg", "tox.ini", "requirements-dev.txt")):
+        return "python -m pytest -q", "pytest is configured or listed"
+    package = read("package.json")
+    if package:
+        with contextlib.suppress(json.JSONDecodeError):
+            if json.loads(package).get("scripts", {}).get("test"):
+                return "npm test", "package.json has a test script"
+    if (root / "go.mod").is_file():
+        return "go test ./...", "go.mod found"
+    if (root / "Cargo.toml").is_file():
+        return "cargo test", "Cargo.toml found"
+    if any(root.glob("tests/test_*.py")):
+        return "python -m unittest discover -s tests", "tests/test_*.py found"
+    if any(root.glob("test_*.py")):
+        return "python -m unittest", "test_*.py found"
+    return "", "no test setup detected; set test_command yourself"
+
+
 # ------------------------------------------------------------------ helpers
 class GateError(Exception):
     pass
@@ -247,7 +277,7 @@ class Output:
         if not self.json:
             print(text, flush=True)
 
-    def event(self, kind: str, text: str, **fields) -> None:
+    def event(self, kind: str, text: str, **fields: Any) -> None:
         with self._lock:
             self.events.append({"event": kind, **fields})
         self.say(text)
@@ -361,18 +391,18 @@ class Gate:
     def load(self, sid: str) -> dict:
         path = self.session_path(sid)
         if not path.exists():
-            raise GateError(f"unknown session {sid!r}")
+            raise GateError(f"unknown session {sid!r}; `gate status --all` lists sessions")
         return json.loads(path.read_text(encoding="utf-8"))
 
     def save(self, session: dict) -> None:
         self.write_json(self.session_path(session["id"]), session)
 
-    def write_json(self, path: Path, data) -> None:
+    def write_json(self, path: Path, data: Any) -> None:
         tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
         os.replace(tmp, path)
 
-    def read_json(self, name: str, default):
+    def read_json(self, name: str, default: Any) -> Any:
         path = self.state / name
         return json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
 
@@ -390,36 +420,57 @@ class Gate:
         return self.read_json("counters.json", {})
 
     @contextlib.contextmanager
-    def lock(self, name: str, timeout_s: float = 30.0, stale_s: float = 3600.0):
-        """Exclusive file lock. A lock left by a dead process on this host is taken over at once;
-        one from another host (or unreadable) is only broken after stale_s."""
+    def lock(self, name: str, timeout_s: float = 30.0) -> Iterator[None]:
+        """Exclusive lock file recording `pid host token`. While it is held, a heartbeat thread touches
+        it every LOCK_HEARTBEAT_S. Another process may break it only if the owner is a dead process on
+        this host, or if it has not been touched for LOCK_STALE_S (owner crashed, frozen, its pid was
+        reused, or it runs on another host sharing the repository over a network filesystem)."""
         path = self.state / f"{name}.lock"
-        owner = f"{os.getpid()} {socket.gethostname()}"
+        token = f"{os.getpid()} {socket.gethostname()} {uuid.uuid4().hex}"
         deadline = time.time() + timeout_s
         while True:
             try:
                 fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.write(fd, owner.encode())
+                os.write(fd, token.encode())
                 os.close(fd)
                 break
             except (FileExistsError, PermissionError):
-                if self._lock_is_stale(path, stale_s):
-                    self._break_stale_lock(path, stale_s)
+                if self._lock_is_stale(path):
+                    self._break_stale_lock(path)
                     continue
                 if time.time() > deadline:
-                    raise GateError(f"{name} lock is held by another gate process ({path})") from None
+                    raise GateError(f"{name} lock is held by another gate process ({path}); it is taken "
+                                    f"over automatically once that process exits or stops refreshing it "
+                                    f"for {LOCK_STALE_S:.0f} s") from None
                 time.sleep(0.05)
+        stop = threading.Event()
+        heartbeat = threading.Thread(target=self._heartbeat, args=(path, token, stop), daemon=True)
+        heartbeat.start()
         try:
             yield
         finally:
-            self._release_lock(path)
+            stop.set()
+            heartbeat.join()
+            self._release_lock(path, token)
 
     @staticmethod
-    def _release_lock(path: Path) -> None:
-        # On Windows a concurrent reader (another process checking staleness) briefly blocks
-        # deletion; retry instead of leaving a lock that names a live pid.
+    def _heartbeat(path: Path, token: str, stop: threading.Event) -> None:
+        while not stop.wait(LOCK_HEARTBEAT_S):
+            try:
+                if path.read_text(encoding="utf-8") != token:
+                    return  # broken while we were frozen: stop claiming it
+                os.utime(path)
+            except OSError:
+                continue  # transient sharing violation on Windows; retry on the next beat
+
+    @staticmethod
+    def _release_lock(path: Path, token: str) -> None:
+        # Delete the lock only while it is still ours. On Windows a concurrent reader (another process
+        # checking staleness) briefly blocks deletion, so retry.
         for attempt in range(50):
             try:
+                if path.read_text(encoding="utf-8") != token:
+                    return
                 path.unlink()
                 return
             except FileNotFoundError:
@@ -428,7 +479,7 @@ class Gate:
                 time.sleep(0.01 * min(attempt + 1, 10))
         raise GateError(f"could not release lock {path}")
 
-    def _break_stale_lock(self, path: Path, stale_s: float) -> None:
+    def _break_stale_lock(self, path: Path) -> None:
         """Remove a stale lock without racing other breakers: only the holder of `<lock>.break` may
         delete it, after re-checking. A live owner never loses its lock, because a fresh lock file can
         only appear after the stale one is gone, and only the breaker removes that."""
@@ -443,7 +494,7 @@ class Gate:
             return
         try:
             os.close(fd)
-            if self._lock_is_stale(path, stale_s):
+            if self._lock_is_stale(path):
                 with contextlib.suppress(FileNotFoundError, PermissionError):
                     path.unlink()
         finally:
@@ -451,17 +502,19 @@ class Gate:
                 breaker.unlink()
 
     @staticmethod
-    def _lock_is_stale(path: Path, stale_s: float) -> bool:
+    def _lock_is_stale(path: Path) -> bool:
         try:
             owner = path.read_text(encoding="utf-8").split()
             age = time.time() - path.stat().st_mtime
-        except (FileNotFoundError, PermissionError, OSError):
+        except OSError:
             return False
-        if len(owner) == 2 and owner[1] == socket.gethostname() and owner[0].isdigit():
+        if age > LOCK_STALE_S:
+            return True
+        if len(owner) >= 2 and owner[1] == socket.gethostname() and owner[0].isdigit():
             return not pid_alive(int(owner[0]))
-        return age > stale_s
+        return False
 
-    def update(self, sid: str, expected_head: str | None = None, **changes) -> bool:
+    def update(self, sid: str, expected_head: str | None = None, **changes: Any) -> bool:
         """Read-modify-write a session; skip if it was resubmitted with a new head."""
         with self.lock("state"):
             session = self.load(sid)
@@ -489,7 +542,10 @@ class Gate:
         tracking = f"refs/remotes/{remote}/{self.target}"
         git("fetch", "--quiet", remote, f"+refs/heads/{self.target}:{tracking}", cwd=self.root)
         tip = self.rev(tracking)
+        previous = git_run("rev-parse", "--verify", "--quiet", f"refs/heads/{self.target}", cwd=self.root)
         git("update-ref", f"refs/heads/{self.target}", tip, cwd=self.root)
+        if previous.stdout.strip() != tip:
+            self.config = self._load_config()  # the policy lives on the target; it may have just changed
         return tip
 
     def advance(self, old: str, new: str) -> None:
@@ -813,8 +869,7 @@ class Gate:
         return recovered
 
     def drain_lane(self, lane: str, drain: bool, wait: float) -> None:
-        stale = max(3600.0, 4.0 * self.config["test_timeout_s"])
-        with self.lock(f"lane-{lane}", timeout_s=wait, stale_s=stale):
+        with self.lock(f"lane-{lane}", timeout_s=wait):
             self.reconcile(lane)
             while True:
                 queued = sorted((s for s in self.sessions()
@@ -839,22 +894,27 @@ class Gate:
 
 
 # -------------------------------------------------------------------- commands
-def cmd_init(gate: Gate, args) -> int:
+def cmd_init(gate: Gate, args: argparse.Namespace) -> int:
     path = gate.root / CONFIG_FILE
     created = not path.exists()
+    command, evidence = detect_test_command(gate.root)
     if created:
-        path.write_text(SAMPLE_CONFIG, encoding="utf-8")
+        sample = SAMPLE_CONFIG.replace("test_command = 'python -m unittest discover -s tests'",
+                                       f"test_command = {json.dumps(command)}  # detected: {evidence}")
+        path.write_text(sample, encoding="utf-8")
         OUT.say(f"wrote {path}")
+        OUT.say(f"test_command = {command!r} ({evidence})")
     else:
         OUT.say(f"{path} already exists (left unchanged)")
     git("config", "extensions.worktreeConfig", "true", cwd=gate.root)
-    OUT.say(f"next: edit test_command, commit {CONFIG_FILE} to '{gate.target}', run `gate doctor`,")
+    OUT.say(f"next: check test_command, commit {CONFIG_FILE} to '{gate.target}', run `gate doctor`,")
     OUT.say(f"      and run the queue from a checkout that is not on '{gate.target}' (git switch --detach).")
-    OUT.result = {"config": str(path), "created": created, "target": gate.target}
+    OUT.result = {"config": str(path), "created": created, "target": gate.target,
+                  "test_command": command if created else None, "detected_from": evidence if created else None}
     return 0
 
 
-def cmd_spawn(gate: Gate, args) -> int:
+def cmd_spawn(gate: Gate, args: argparse.Namespace) -> int:
     sid = args.session
     if not SESSION_ID.match(sid):
         raise GateError("session id must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}")
@@ -888,7 +948,7 @@ def cmd_spawn(gate: Gate, args) -> int:
     return 0
 
 
-def cmd_submit(gate: Gate, args) -> int:
+def cmd_submit(gate: Gate, args: argparse.Namespace) -> int:
     session = gate.load(args.session)
     if session["status"] in {"queued", "needs_approval"} and session.get("head") == gate.rev(session["branch"]):
         # Idempotent: an agent that retries after a timeout gets the same answer, not an error.
@@ -900,11 +960,13 @@ def cmd_submit(gate: Gate, args) -> int:
         raise GateError(f"session is {session['status']}; only active/rejected/too_large can be submitted")
     worktree = session.get("worktree")
     if worktree and Path(worktree).exists() and git("status", "--porcelain", cwd=Path(worktree)).strip():
-        raise GateError("worktree has uncommitted changes; commit them first")
+        raise GateError(f"{worktree} has uncommitted changes; commit (or stash) them, then submit")
     head = gate.rev(session["branch"])
+    gate.sync_tip()  # judge the change against the current target and its current policy
     base = git("merge-base", f"refs/heads/{gate.target}", head, cwd=gate.root).strip()
     if head == base:
-        raise GateError("no commits on the session branch")
+        raise GateError(f"no commits on {session['branch']} yet; commit the change"
+                        + (f" in {worktree}" if worktree else " and push the branch") + ", then submit")
     files, changed, sized = gate.diff_stats(base, head)
     tier = gate.risk_tier(files)
     prompt_sha = None
@@ -966,7 +1028,7 @@ def cmd_submit(gate: Gate, args) -> int:
     return EXIT_POLICY if status in {"too_large", "rejected"} else 0
 
 
-def cmd_approve(gate: Gate, args) -> int:
+def cmd_approve(gate: Gate, args: argparse.Namespace) -> int:
     session = gate.load(args.session)
     already = session["status"] == "queued" and session.get("approved_by") == args.by
     if session["status"] != "needs_approval" and not already:
@@ -978,7 +1040,7 @@ def cmd_approve(gate: Gate, args) -> int:
     return 0
 
 
-def cmd_queue(gate: Gate, args) -> int:
+def cmd_queue(gate: Gate, args: argparse.Namespace) -> int:
     if gate.target_checked_out():
         raise GateError(f"'{gate.target}' is checked out in a worktree; run the gate from a "
                         f"checkout on another branch or detached HEAD")
@@ -1003,7 +1065,7 @@ def cmd_queue(gate: Gate, args) -> int:
     return 0
 
 
-def cmd_verify(gate: Gate, args) -> int:
+def cmd_verify(gate: Gate, args: argparse.Namespace) -> int:
     """Test the target; on failure bisect landed commits and auto-revert the culprit."""
     with gate.lock("verify", timeout_s=args.wait):
         tip = gate.sync_tip()
@@ -1067,7 +1129,7 @@ def cmd_verify(gate: Gate, args) -> int:
         return 0
 
 
-def cmd_abandon(gate: Gate, args) -> int:
+def cmd_abandon(gate: Gate, args: argparse.Namespace) -> int:
     session = gate.load(args.session)
     if session["status"] == "merged":
         raise GateError("session is already merged")
@@ -1080,7 +1142,7 @@ def cmd_abandon(gate: Gate, args) -> int:
     return 0
 
 
-def cmd_trace(gate: Gate, args) -> int:
+def cmd_trace(gate: Gate, args: argparse.Namespace) -> int:
     gate.load(args.session)
     raw = Path(args.file).read_text(encoding="utf-8", errors="replace")
     clean, redactions = redact(raw)
@@ -1105,7 +1167,7 @@ def cmd_trace(gate: Gate, args) -> int:
     return 0
 
 
-def cmd_gc(gate: Gate, args) -> int:
+def cmd_gc(gate: Gate, args: argparse.Namespace) -> int:
     retention = gate.config["retention"]
     now = time.time()
     archived = traces_deleted = attempts_deleted = 0
@@ -1147,7 +1209,7 @@ def cmd_gc(gate: Gate, args) -> int:
     return 0
 
 
-def cmd_status(gate: Gate, args) -> int:
+def cmd_status(gate: Gate, args: argparse.Namespace) -> int:
     rows = gate.sessions()
     if not args.all:
         rows = [s for s in rows if s["status"] in IN_FLIGHT | {"reverted"}]
@@ -1165,7 +1227,7 @@ def cmd_status(gate: Gate, args) -> int:
     return 0
 
 
-def cmd_show(gate: Gate, args) -> int:
+def cmd_show(gate: Gate, args: argparse.Namespace) -> int:
     session = gate.load(args.session)
     OUT.result = {"session": session}
     OUT.say(json.dumps({k: v for k, v in session.items() if k != "detail"}, indent=2))
@@ -1182,7 +1244,7 @@ def cmd_show(gate: Gate, args) -> int:
     return 0
 
 
-def cmd_stats(gate: Gate, args) -> int:
+def cmd_stats(gate: Gate, args: argparse.Namespace) -> int:
     rows = gate.sessions()
     by_status: dict[str, int] = {}
     by_model: dict[str, dict[str, int]] = {}
@@ -1243,7 +1305,7 @@ def cmd_stats(gate: Gate, args) -> int:
     return 0
 
 
-def cmd_doctor(gate: Gate, args) -> int:
+def cmd_doctor(gate: Gate, args: argparse.Namespace) -> int:
     failures = 0
     checks: list[dict] = []
 

@@ -1,4 +1,4 @@
-# gate
+﻿# gate
 
 [![ci](https://github.com/juw12/gate/actions/workflows/ci.yml/badge.svg)](https://github.com/juw12/gate/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/juw12/gate)](https://github.com/juw12/gate/releases)
@@ -21,7 +21,7 @@ needs a human.
 | Retention / ref clutter | Merged sessions delete their branch at once; rejected ones keep it for a grace period, then become a gzipped, redacted diff outside Git refs. Traces expire by outcome. |
 | Checkout cost / remote agents | Shared object store, per-agent worktree with optional sparse cone, or `spawn --no-worktree` for agents running in remote sandboxes that push `agent/<id>`. |
 
-Standard library only. Python ≥ 3.11, Git ≥ 2.40.
+Standard library only. Python â‰¥ 3.11, Git â‰¥ 2.40.
 
 ## How it works
 
@@ -29,7 +29,7 @@ Standard library only. Python ≥ 3.11, Git ≥ 2.40.
 flowchart LR
   A1[agent session] -- spawn / commit --> B[agent/&lt;id&gt; branch]
   A2[agent in remote sandbox] -- push --> B
-  B -- submit --> P{policy<br/>secrets · size · risk tier}
+  B -- submit --> P{policy<br/>secrets Â· size Â· risk tier}
   P -- bounced, exit 2 --> A1
   P -- tier 2 --> H[human: gate approve]
   P -- queued --> L[lane queue]
@@ -45,8 +45,8 @@ flowchart LR
 ```
 
 State lives in `.git/gate/` (session JSON, counters, gzipped traces and archived diffs) and never in Git refs,
-so agent attempts don't bloat clones. Every write is a temp file + atomic rename; cross-process exclusion uses
-lock files that record `pid host`.
+so agent attempts don't bloat clones. Every write is a temp file + atomic rename. Cross-process exclusion uses
+lock files that record `pid host token` and are kept alive by a heartbeat (see [Crash safety](#crash-safety)).
 
 ## Install
 
@@ -59,7 +59,7 @@ gate --version
 
 ```bash
 cd your-repo
-gate init                        # writes gate.toml (lanes, suites, secrets, retention)
+gate init                        # writes gate.toml; detects your test command (pytest, npm, go, cargo, unittest)
 git add gate.toml && git commit -m "gate policy"
 git switch --detach                   # the gate must not have the target branch checked out
 gate doctor                      # add --write-test when `remote` is set
@@ -102,6 +102,14 @@ read `result.reason` / `result.findings`, fix and resubmit), then poll `gate --j
 `result.session.status` is `merged`, `rejected` (read `detail`) or `reverted`. `submit` is idempotent: retrying
 an unchanged queued session returns the same answer instead of an error.
 
+[`examples/agent_loop.py`](examples/agent_loop.py) is a complete reference client (about 100 lines, JSON interface
+only, no imports from gate). The test suite runs it end to end, so it cannot drift from the real interface:
+
+```bash
+python examples/agent_loop.py --repo . --session fix-1 --model my-model \
+    --file docs/note.md "hello" --drive-queue
+```
+
 | Exit code | Meaning |
 |---|---|
 | `0` | ok |
@@ -121,22 +129,26 @@ Any gate process can be killed at any point without losing or duplicating work:
 | after publishing, before recording `merged` | `queue` (and `gc`) first reconciles: every gate commit carries an `Agent-Head` trailer, so sessions whose head is already on the target are marked `merged` (`recovered: true`) instead of being landed twice. |
 | after recording `merged`, before deleting the branch | `gc` removes leftover branches and worktrees of merged/abandoned sessions. |
 
-Locks from a dead process on the same host are taken over immediately; a lock from another host (shared
-filesystem) is only broken after it is older than `max(1 h, 4 × test_timeout_s)`. These paths are covered by tests
-that simulate a kill after publish, leftover branches, and dead/live/remote lock owners.
+Locks are kept alive by a heartbeat: the holder touches its lock file every 5 s, however long its tests run.
+A lock is taken over when its owner is a dead process on this host (at once), or when nobody has touched it
+for 60 s: the owner crashed, froze, runs on another machine sharing the repository over a network filesystem,
+or its pid was reused by an unrelated process. Breaking a stale lock goes through a separate breaker file and a
+re-check, so two processes can never both take it over, and a holder only ever deletes a lock that still
+carries its own token. Tests cover a kill after publish, leftover branches, dead/live/foreign owners, a reused
+pid, a long-running holder, a lock that changed hands, and 24 contenders racing for one dead lock.
 
 ## Measured
 
-Unit/e2e: `python -m unittest -v test_gate`, 32 tests on real repos (crash recovery, contended locks, JSON interface,
-remote races, verify/revert, secrets). CI also enforces `ruff`, `mypy` and ≥ 85 % line coverage of `gate.py`.
+Unit/e2e: `python -m unittest -v test_gate`, 40 tests on real repos (crash recovery, contended locks, JSON interface,
+remote races, verify/revert, secrets). CI also enforces `ruff`, `mypy` and â‰¥ 85 % line coverage of `gate.py`.
 
 Throughput, from `python bench.py --sessions 160 --lanes 8 --test-seconds 2 --batch 8` on one Windows laptop
 (Git 2.55, Python 3.13), with a 2 s sleep standing in for CI:
 
 | `--parallel` | wall | merges/day (extrapolated) | commuted publishes | publish-lock hold | ceiling of the serialized step |
 |---|---|---|---|---|---|
-| 1 | 109.5 s | 126 k | 0 / 24 | 87 ms | — |
-| 8 | 45.9 s | 301 k | 22 / 24 | 1.4 s per 6.7 merges | ≈ 408 k/day |
+| 1 | 109.5 s | 126 k | 0 / 24 | 87 ms | â€” |
+| 8 | 45.9 s | 301 k | 22 / 24 | 1.4 s per 6.7 merges | â‰ˆ 408 k/day |
 
 The serialized publish step stops being the limit at about 400k merges/day on this hardware.
 Above that, throughput is set by CI capacity: about \(\text{lanes} \times \text{batch} / \text{test time}\).
@@ -155,10 +167,18 @@ branch. `gate doctor --write-test` proves reachability and write access by pushi
 It cannot prove the bypass on the protected branch itself; only a real publish does.
 Agents never open PRs, so `refs/pull/*` doesn't grow.
 
-Verified against github.com (this repo, on a throwaway branch): `doctor --write-test`
-passed; a session published and GitHub's branch head matched the gate's merged commit; with a
-concurrent human push landing mid-test, the gate kept the human commit and replayed its own
-commit on top (`Commuted-From:`) without re-testing.
+[`e2e_github.py`](e2e_github.py) checks all of this against a real remote, on a throwaway `gate-e2e/<id>` branch
+that it deletes afterwards, and the [`e2e` workflow](.github/workflows/e2e.yml) runs it against this repository
+weekly and on demand:
+
+| Scenario | What must happen |
+|---|---|
+| batch | three sessions publish in one queue run; GitHub's branch head equals the gate's merged commit |
+| crash | the gate is killed after the push reached GitHub but before recording it; the next run recovers both sessions and GitHub gets no duplicate commits |
+| race | a human pushes an unrelated commit while the gate is testing; the gate keeps it and replays its own commit on top (`Commuted-From:`) without re-testing |
+
+Policy is read from the remote target: a stricter `gate.toml` pushed to the remote applies to the very next
+`submit`.
 
 ## What is still out of scope
 
@@ -167,11 +187,12 @@ commit on top (`Commuted-From:`) without re-testing.
   invisible to any merge gate.
 - **Redaction is best-effort.** Patterns plus entropy catch common formats; plug in gitleaks/trufflehog via
   `secret_scan_command` for fail-closed coverage, and still treat traces as sensitive.
-- **One host holds the state.** Lanes run in parallel, and several gate processes on the same host can share a
-  repo (file locks), but state lives in `.git/gate`. Running gates on several hosts needs a shared store.
-  A Scion-class system would replace the file locks with a database.
+- **State is files, not a database.** Several gate processes can share a repository, on one host or across hosts
+  through a network filesystem with working `O_EXCL` (heartbeat locks, atomic renames). The cross-host case is
+  tested by simulating foreign owners, not on a real NFS cluster. A Scion-class deployment would put session
+  state in a database.
 - **Platforms:** CI (`.github/workflows/ci.yml`) runs tests, demo and benchmark on Linux, macOS and
-  Windows × Python 3.11/3.13.
+  Windows Ã— Python 3.11/3.13.
 
 See [CHANGELOG.md](CHANGELOG.md) for releases and [CONTRIBUTING.md](CONTRIBUTING.md) to work on gate.
 MIT licensed.

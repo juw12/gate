@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gate"
-version = "0.2.0"
+version = "0.3.0"
 description = "Merge gate for AI-agent-generated changes: batched, tested, risk-tiered, provenance-tagged."
 requires-python = ">=3.11"
 readme = "README.md"
@@ -38,6 +38,10 @@ select = ["E", "F", "W", "B", "UP", "I"]
 [tool.mypy]
 python_version = "3.11"
 warn_unused_ignores = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+warn_redundant_casts = true
 
 [tool.coverage.run]
 include = ["gate.py"]

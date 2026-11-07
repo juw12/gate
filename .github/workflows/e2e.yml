@@ -1,0 +1,26 @@
+name: e2e
+
+# Runs e2e_github.py against this repository: batch publish, crash-after-push recovery and a concurrent push,
+# on a throwaway gate-e2e/<id> branch that the script deletes. Not triggered by pushes (CI covers those).
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  github:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Git identity
+        run: |
+          git config --global user.name gate-e2e
+          git config --global user.email gate-e2e@users.noreply.github.com
+      - name: End-to-end against github.com
+        run: python e2e_github.py "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"

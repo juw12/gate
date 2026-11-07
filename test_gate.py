@@ -698,6 +698,134 @@ class GateTest(unittest.TestCase):
         code, out = self.gate("--json", "init")
         self.assertFalse(json.loads(out)["result"]["created"])
 
+    # ------------------------------------------------------------ lock liveness (heartbeat)
+    def test_heartbeat_keeps_a_long_running_holder_safe(self):
+        self.make_repo()
+        instance = gate.Gate(self.repo)
+        acquired = threading.Event()
+
+        def hold() -> None:
+            with instance.lock("long"):
+                acquired.set()
+                time.sleep(1.2)
+
+        with mock.patch.object(gate, "LOCK_HEARTBEAT_S", 0.05), mock.patch.object(gate, "LOCK_STALE_S", 0.4):
+            holder = threading.Thread(target=hold)
+            holder.start()
+            acquired.wait(5)
+            with self.assertRaises(gate.GateError):
+                with instance.lock("long", timeout_s=0.8):
+                    pass  # pragma: no cover - must not be reached while the holder is alive
+            holder.join()
+            with instance.lock("long", timeout_s=1):
+                pass
+        self.assertFalse((instance.state / "long.lock").exists())
+
+    def test_silent_lock_is_taken_over_even_if_its_pid_was_reused(self):
+        self.make_repo()
+        instance = gate.Gate(self.repo)
+        lock = instance.state / "reused.lock"
+        lock.write_text(f"{os.getpid()} {gate.socket.gethostname()} old-token")  # live pid, wrong process
+        old = time.time() - 10 * gate.LOCK_STALE_S
+        os.utime(lock, (old, old))
+        with instance.lock("reused", timeout_s=2):
+            self.assertNotIn("old-token", lock.read_text())
+
+    def test_release_never_deletes_a_lock_that_changed_hands(self):
+        self.make_repo()
+        instance = gate.Gate(self.repo)
+        lock = instance.state / "handover.lock"
+        with instance.lock("handover"):
+            lock.write_text("4242 other-host new-owner")  # e.g. broken while we were frozen
+        self.assertEqual(lock.read_text(), "4242 other-host new-owner")
+
+    # ------------------------------------------------------------ guided init
+    def test_init_detects_the_test_command(self):
+        cases = {
+            "pytest": ({"pyproject.toml": "[tool.pytest.ini_options]\n"}, "python -m pytest -q"),
+            "npm": ({"package.json": json.dumps({"scripts": {"test": "jest"}})}, "npm test"),
+            "go": ({"go.mod": "module x\n"}, "go test ./..."),
+            "cargo": ({"Cargo.toml": "[package]\n"}, "cargo test"),
+            "unittest": ({"tests/test_x.py": ""}, "python -m unittest discover -s tests"),
+            "root-tests": ({"test_x.py": ""}, "python -m unittest"),
+            "none": ({"README.md": "hi"}, ""),
+        }
+        for label, (files, expected) in cases.items():
+            with self.subTest(label):
+                root = self.tmp / label
+                root.mkdir()
+                for name, content in files.items():
+                    (root / name).parent.mkdir(parents=True, exist_ok=True)
+                    (root / name).write_text(content)
+                self.assertEqual(gate.detect_test_command(root)[0], expected)
+        self.make_repo()
+        (self.repo / "gate.toml").unlink()
+        code, out = self.gate("--json", "init")
+        result = json.loads(out)["result"]
+        self.assertEqual(result["test_command"], "python -m unittest discover -s tests")
+        config = gate.tomllib.loads((self.repo / "gate.toml").read_text())
+        self.assertEqual(config["test_command"], "python -m unittest discover -s tests")
+
+    def test_errors_tell_the_user_what_to_do(self):
+        self.make_repo()
+        code, out = self.gate("show", "ghost")
+        self.assertIn("gate status --all", out)
+        worktree = self.spawn("empty")
+        code, out = self.gate("submit", "empty", "--model", "m")
+        self.assertEqual(code, gate.EXIT_ERROR)
+        self.assertIn(f"commit the change in {worktree}", out)
+        (worktree / "dirty.txt").write_text("x")
+        run_git("add", "dirty.txt", cwd=worktree)
+        code, out = self.gate("submit", "empty", "--model", "m")
+        self.assertIn("uncommitted changes", out)
+
+    # ------------------------------------------------------------ reference agent
+    def test_reference_agent_example_merges_through_the_json_interface(self):
+        self.make_repo()
+        example = Path(__file__).resolve().parent / "examples" / "agent_loop.py"
+        proc = subprocess.run(
+            [PY, str(example), "--repo", str(self.repo), "--session", "ex1", "--model", "example-model",
+             "--file", "docs/example.md", "# written by the example agent\n", "--drive-queue",
+             "--timeout", "120"],
+            capture_output=True, text=True, timeout=300,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("final: merged", proc.stdout)
+        self.assertIn("Agent-Model: example-model", self.main_log())
+        self.assertEqual(self.main_file("docs/example.md"), "# written by the example agent\n")
+
+    # ------------------------------------------------------------ reporting
+    def test_reports_show_history_and_reasons(self):
+        self.make_repo()
+        self.assertEqual(self.agent("good", self.feature(1))[0], 0)
+        self.agent("bad", {"calc.py": CALC.replace("return a + b", "return a - b")}, model="model-b")
+        self.assertEqual(self.gate("queue", "--drain")[0], 0)
+        code, out = self.gate("stats")
+        self.assertIn("not-merged reasons:  tests=1", out)
+        self.assertIn("model model-b", out)
+        self.assertIn("submit->merge median", out)
+        code, out = self.gate("status", "--all")
+        self.assertIn("good", out)
+        self.assertIn("bad", out)
+        code, out = self.gate("show", "good", "--patch")
+        self.assertIn("+def feature_1():", out)
+        code, out = self.gate("show", "bad")
+        self.assertIn("--- detail ---", out)
+
+    def test_policy_pushed_to_the_remote_applies_to_the_next_submit(self):
+        self.make_repo(remote=True)
+        human = self.tmp / "human"
+        run_git("clone", "-q", str(self.origin), str(human), cwd=self.tmp)
+        config = (human / "gate.toml").read_text().replace("max_changed_lines = 400", "max_changed_lines = 5")
+        (human / "gate.toml").write_text(config)
+        run_git("-c", "user.name=H", "-c", "user.email=h@x", "commit", "-qam", "tighten size gate", cwd=human)
+        run_git("push", "-q", "origin", "HEAD:main", cwd=human)
+        worktree = self.spawn("big2")
+        self.commit(worktree, {"lib/b.py": "".join(f"v{i} = {i}\n" for i in range(20))}, "20 lines")
+        code, out = self.gate("--json", "submit", "big2", "--model", "m")
+        self.assertEqual(code, gate.EXIT_POLICY, out)
+        self.assertEqual(json.loads(out)["result"]["status"], "too_large")
+
 
 if __name__ == "__main__":
     unittest.main()
