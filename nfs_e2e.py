@@ -9,8 +9,9 @@ of A's (libfaketime). The checks:
                must fail, although by B's clock the lock file looks SKEW_S old (a timestamp-comparison
                rule would break it).
 2. dead lock:  A is killed (`docker kill`, no cleanup). B takes the lock over after LOCK_STALE_S of silence.
-3. queue:      `gate queue --drain` runs on A and B at the same time over shared lanes; every session lands
-               exactly once.
+3. queue:      `gate queue --drain` runs on A and B at the same time, first one lane per host (both publish
+               to the same branch concurrently and race on the compare-and-swap), then both on all lanes
+               (contending for lane locks); every session lands exactly once.
 
 Needs Linux, docker, and an NFS server exporting NFS_EXPORT to the docker bridge network
 (see .github/workflows/nfs.yml). Writes a Markdown summary to $GITHUB_STEP_SUMMARY when set.
@@ -183,41 +184,64 @@ def lock_checks(results: dict) -> None:
     wait_for_mount("host-a")
 
 
-def queue_check(results: dict) -> None:
+def submit_sessions(prefix: str) -> list[str]:
+    sids = []
     for n in range(SESSIONS):
         host = "host-a" if n % 2 == 0 else "host-b"
         lane = "a" if n < SESSIONS // 2 else "b"
-        sid = f"s{n}"
+        sid = f"{prefix}{n}"
         worktree = on(host, f"python /src/gate.py -C /work/repo spawn {sid}").stdout.strip().splitlines()[-1]
         on(host, f"""
             set -e
             cd {worktree}
-            echo 'change {n}' > {lane}/f{n}.txt
+            echo '{sid}' > {lane}/{sid}.txt
             git add -A && git commit -qm '{sid}: change'
             python /src/gate.py -C /work/repo submit {sid} --model nfs-test
         """)
+        sids.append(sid)
+    return sids
 
+
+def drain_concurrently(flags: dict[str, str]) -> tuple[dict[str, list[str]], float]:
     def drain(host: str) -> subprocess.CompletedProcess:
-        return on(host, "python /src/gate.py -C /work/repo --json queue --drain --parallel 2 --wait 300",
+        return on(host, f"python /src/gate.py -C /work/repo --json queue --drain --wait 300 {flags[host]}",
                   check=False, timeout=900)
 
     started = time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(2) as pool:
-        procs = dict(zip(HOSTS, pool.map(drain, HOSTS), strict=True))
-    results["drain_seconds"] = round(time.monotonic() - started, 1)
+        procs = dict(zip(flags, pool.map(drain, flags), strict=True))
     merged_by = {}
     for host, proc in procs.items():
-        check(proc.returncode == 0, f"queue --drain on {host} exited 0 ({proc.stderr.strip()[-300:]})")
+        check(proc.returncode == 0, f"queue --drain {flags[host]} on {host} exited 0 {proc.stderr.strip()[-300:]}")
         merged_by[host] = [item["session"] for item in json.loads(proc.stdout)["result"]["merged"]]
-    results["merged_by"] = merged_by
+    return merged_by, round(time.monotonic() - started, 1)
+
+
+def check_exactly_once(sids: list[str], merged_by: dict[str, list[str]]) -> None:
     log = on("host-a", "git -C /work/repo log --format=%B%x00 main").stdout
-    for n in range(SESSIONS):
-        check(log.count(f"Agent-Session: s{n}\n") == 1, f"session s{n} is on main exactly once")
+    for sid in sids:
+        check(log.count(f"Agent-Session: {sid}\n") == 1, f"session {sid} is on main exactly once")
+    reported = sorted(s for merged in merged_by.values() for s in merged)
+    check(reported == sorted(sids), f"each merge reported by exactly one host: {merged_by}")
+
+
+def queue_check(results: dict) -> None:
+    # Phase 1: each host owns one lane, so both publish to the same branch at the same time and race
+    # on the compare-and-swap; batches of 4 mean several publishes per host.
+    first = submit_sessions("s")
+    merged_by, seconds = drain_concurrently({"host-a": "--lane a", "host-b": "--lane b"})
+    check(bool(merged_by["host-a"]) and bool(merged_by["host-b"]), "both hosts published")
+    check_exactly_once(first, merged_by)
+    results["phase1_lane_per_host"] = {"merged_by": merged_by, "seconds": seconds}
+    # Phase 2: both hosts drain every lane with --parallel 2 and contend for the lane locks.
+    second = submit_sessions("t")
+    merged_by, seconds = drain_concurrently({"host-a": "--parallel 2", "host-b": "--parallel 2"})
+    check_exactly_once(second, merged_by)
+    results["phase2_shared_lanes"] = {"merged_by": merged_by, "seconds": seconds}
     statuses = json.loads(on("host-b", "python /src/gate.py -C /work/repo --json status --all").stdout)
-    check(all(s["status"] == "merged" for s in statuses["result"]["sessions"]) and
-          len(statuses["result"]["sessions"]) == SESSIONS, "every session is recorded as merged")
-    check(sum(len(v) for v in merged_by.values()) == SESSIONS,
-          f"each merge reported once across hosts: {merged_by}")
+    sessions = statuses["result"]["sessions"]
+    check(len(sessions) == 2 * SESSIONS and all(s["status"] == "merged" for s in sessions),
+          "every session is recorded as merged")
 
 
 def main() -> int:
@@ -248,8 +272,10 @@ def main() -> int:
                 f"naive age seen by B {results['live']['naive_age']} s |\n"
                 f"| dead lock (docker kill A) | taken over after {results['dead']['elapsed']} s "
                 f"(LOCK_STALE_S = {LOCK_STALE_S}) |\n"
-                f"| concurrent drain, 2 hosts x 2 lanes | {SESSIONS} sessions, each on main once, "
-                f"{results['drain_seconds']} s; merged by host: {results['merged_by']} |\n")
+                f"| both hosts publish at once (one lane each) | {SESSIONS} sessions, each on main once; "
+                f"merged by host: {results['phase1_lane_per_host']['merged_by']} |\n"
+                f"| both hosts drain all lanes (--parallel 2) | {SESSIONS} sessions, each on main once; "
+                f"merged by host: {results['phase2_shared_lanes']['merged_by']} |\n")
     return 0
 
 
