@@ -46,7 +46,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 CONFIG_FILE = "gate.toml"
 LOCK_HEARTBEAT_S = 5.0   # a lock holder touches its lock file this often

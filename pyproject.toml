@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gate"
-version = "0.3.0"
+version = "0.4.0"
 description = "Merge gate for AI-agent-generated changes: batched, tested, risk-tiered, provenance-tagged."
 requires-python = ">=3.11"
 readme = "README.md"

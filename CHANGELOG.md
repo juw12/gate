@@ -3,6 +3,51 @@
 All notable changes. Versions follow [semantic versioning](https://semver.org/); the JSON output and exit
 codes are part of the public interface.
 
+## [0.4.0] - 2026-11-07
+
+Every finding of the round-2 review was checked in the code first; all were real and are fixed here.
+
+### Fixed
+- **Locks across hosts.** Staleness compared a lock file's mtime with the local clock, so clock skew between
+  hosts (or NFS attribute caching) could make a live lock look abandoned. Liveness is now judged by observation:
+  a lock is taken over only after this process has watched it stay unchanged for `LOCK_STALE_S` on its own
+  monotonic clock (or its owner is a dead pid on this host, or it is older than 10x `LOCK_STALE_S`). Lock files
+  are read with open() + fstat() so NFS close-to-open consistency applies. Proven on a real NFS export with two
+  hosts and a 120 s clock skew (`nfs` workflow).
+- **Protected branches.** A push refused by branch protection or a hook was treated as contention: the batch
+  was re-tested five times and the run ended with a misleading "target kept moving". Only lease failures count
+  as contention now; any other refusal stops at once with the remote's message and what to do, sessions stay
+  queued, tests run once.
+- **Checked-out target.** Only `queue` refused to run while the target branch was checked out; `sync_tip` and
+  `advance` (remote fetch, verify revert) could still move it under a worktree. Both now refuse.
+- **Crash during verify.** A verify killed after publishing a revert never marked the session `reverted`. The
+  next verify reconciles from the `Reverts:` / `Agent-Session:` trailers (`result.recovered`).
+- **gc vs resubmit.** gc abandoned rejected sessions from a snapshot taken without the state lock, so a session
+  fixed and resubmitted meanwhile could lose its branch. Abandon is now a compare-and-set on head and status.
+- **Atomic writes.** Traces and archived patches are written via temp file + rename like all other state.
+- **External scanner.** A scanner that hangs or cannot start is a finding (fail closed) instead of a crash;
+  limit `SCAN_TIMEOUT_S` = 300 s.
+- **merge-tree errors.** A merge-tree failure on a bad head was reported as an empty conflict; it is now an
+  error naming the session.
+- **Windows lock breaking.** Watching a stale-lock breaker file kept a handle open that stopped its owner
+  deleting it (found by CI). The breaker is observed with stat(), and unlinks retry briefly.
+- README encoding: the 0.3.0 README had a byte-order mark and mojibake from an editor round trip.
+
+### Added
+- `--json` is accepted after the subcommand as well (`gate queue --json`).
+- `gate completion bash|zsh|fish`, generated from the parser.
+- `gate doctor --fix` detaches a clean main checkout that has the target checked out.
+- `GATE_LOCK_STALE_S` environment variable (default 60).
+- Tests that kill the real process (SIGKILL / TerminateProcess) after a publish and after a revert publish,
+  instead of raising an exception in-process; tests for skewed and silent foreign locks, a protected remote,
+  the checked-out guard, gc racing a resubmit, atomic writes, scanner timeout, merge-tree failure, verify with no
+  green baseline, completion scripts, doctor --fix, and clean UTF-8 in every tracked text file.
+- `nfs_e2e.py` + `nfs` workflow: two docker hosts, each its own NFS client, one clock 120 s ahead; live lock
+  kept, dead host's lock taken over after `LOCK_STALE_S`, both hosts draining at once land every session once.
+- `e2e_github.py`: the crash scenario now kills the real process; new `protected` (branch protection with
+  admins enforced, then the documented bypass) and `throughput` (ten publishes, lock-hold median/p95) scenarios.
+- `bench.py --test-seconds-max` (per-candidate suite time drawn from a seeded uniform range) and `--modes`.
+
 ## [0.3.0] - 2026-11-07
 
 ### Added

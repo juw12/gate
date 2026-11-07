@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """End-to-end check of gate against a real hosted remote (e.g. a GitHub repository you can push to).
 
-Everything happens on a throwaway target branch `gate-e2e/<id>`, which is deleted at the end:
+Everything happens on a throwaway target branch `gate-e2e-<id>`, which is deleted at the end:
 
-  1. batch    - three agent sessions are submitted and published in one queue run
-  2. crash    - the gate is killed after pushing but before recording the merge; the next run
-                recovers both sessions and the remote gets no duplicate commits
-  3. race     - a human pushes an unrelated commit while the gate is testing; the gate keeps it and
-                replays its own commit on top without re-testing
+  1. batch      - three agent sessions are submitted and published in one queue run
+  2. crash      - the gate process is killed (SIGKILL / TerminateProcess) after its push reached the
+                  remote but before it recorded the merge; the next run recovers both sessions and the
+                  remote gets no duplicate commits
+  3. race       - a human pushes an unrelated commit while the gate is testing; the gate keeps it and
+                  replays its own commit on top without re-testing
+  4. protected  - the branch is protected (pull request required, admins included): the push is refused,
+                  gate says so at once, runs the tests once, keeps the session queued and leaves the
+                  remote untouched; after the gate's account gets a bypass (admins exempted) the same
+                  session publishes. Needs a token with admin rights on the repository in
+                  GATE_E2E_ADMIN_TOKEN; skipped otherwise.
+  5. throughput - ten publishes one after another; reports the median and p95 time the publish lock is
+                  held (fetch + push round trips dominate)
 
     python e2e_github.py https://github.com/OWNER/REPO.git [--keep]
 
@@ -22,11 +30,14 @@ import json
 import os
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.parse
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any
@@ -103,23 +114,18 @@ def scenario_batch(repo: Path, branch: str) -> dict[str, Any]:
 def scenario_crash(repo: Path, branch: str) -> dict[str, Any]:
     for n in (1, 2):
         agent(repo, f"c{n}", {f"e2e/crash_{n}.txt": f"crash {n}\n"})
-    real_update = gate.Gate.update
-
-    def killed_after_push(instance: gate.Gate, sid: str, expected_head: str | None = None, **changes: Any) -> bool:
-        if changes.get("status") == "merged":
-            raise KeyboardInterrupt("simulated kill after the push reached the remote")
-        return real_update(instance, sid, expected_head, **changes)
-
-    with mock.patch.object(gate.Gate, "update", killed_after_push), contextlib.suppress(KeyboardInterrupt):
-        run_gate(repo, "queue", "--drain")
+    killed = subprocess.run([PY, gate.__file__, "-C", str(repo), "queue", "--drain"], capture_output=True,
+                            text=True, env={**os.environ, "GATE_FAULT": "after-publish"})
     pushed = remote_log(repo, branch)
     published_before = pushed.count("\x00") // 2
     code, doc = run_gate(repo, "queue", "--drain")
     recovered = sorted(item["session"] for item in doc["result"]["recovered"])
     after = remote_log(repo, branch)
-    ok = (code == 0 and recovered == ["c1", "c2"] and after.count("\x00") // 2 == published_before
+    ok = (killed.returncode != 0 and code == 0 and recovered == ["c1", "c2"]
+          and after.count("\x00") // 2 == published_before
           and all(after.count(f"Agent-Session: c{n}\n") == 1 for n in (1, 2)))
-    return {"ok": ok, "recovered": recovered, "remote_commits_unchanged": after == pushed}
+    return {"ok": ok, "killed_exit_code": killed.returncode, "recovered": recovered,
+            "remote_commits_unchanged": after == pushed}
 
 
 def scenario_race(repo: Path, branch: str) -> dict[str, Any]:
@@ -148,12 +154,87 @@ def scenario_race(repo: Path, branch: str) -> dict[str, Any]:
     return {"ok": ok, "top_two_commits": subjects, "commuted": "Commuted-From:" in log}
 
 
+def github_api(token: str, method: str, path: str, body: dict | None = None) -> tuple[int, Any]:
+    request = urllib.request.Request(
+        f"https://api.github.com{path}", method=method,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                 "X-GitHub-Api-Version": "2022-11-28"})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            data = response.read()
+            return response.status, json.loads(data) if data else None
+    except urllib.error.HTTPError as error:
+        return error.code, error.read().decode(errors="replace")[:300]
+
+
+def scenario_protected(repo: Path, branch: str, slug: str | None) -> dict[str, Any]:
+    token = os.environ.get("GATE_E2E_ADMIN_TOKEN", "")
+    if not token or not slug:
+        return {"ok": None, "skipped": "set GATE_E2E_ADMIN_TOKEN (admin on the repository) to run"}
+    protection = f"/repos/{slug}/branches/{urllib.parse.quote(branch, safe='')}/protection"
+    status, detail = github_api(token, "PUT", protection, {
+        "required_status_checks": None, "enforce_admins": True, "restrictions": None,
+        "required_pull_request_reviews": {"required_approving_review_count": 1}})
+    if status != 200:
+        return {"ok": False, "error": f"could not protect the branch: HTTP {status} {detail}"}
+    try:
+        agent(repo, "p1", {"e2e/protected.txt": "protected\n"})
+        before = remote_log(repo, branch)
+        calls = {"n": 0}
+        original = gate.Gate.run_tests
+
+        def counting(instance: gate.Gate, commit: str, changed: list[str] | None = None) -> tuple[bool, str]:
+            calls["n"] += 1
+            return original(instance, commit, changed)
+
+        started = time.perf_counter()
+        with mock.patch.object(gate.Gate, "run_tests", counting):
+            code, doc = run_gate(repo, "queue", "--drain")
+        refused_seconds = time.perf_counter() - started
+        error = doc.get("error", "")
+        status_doc = run_gate(repo, "show", "p1")[1]
+        refused = (code == gate.EXIT_ERROR and "rejected the push" in error and calls["n"] == 1
+                   and status_doc["result"]["session"]["status"] == "queued"
+                   and remote_log(repo, branch) == before)
+
+        github_api(token, "DELETE", f"{protection}/enforce_admins")  # the documented remedy: a bypass
+        code, doc = run_gate(repo, "queue", "--drain")
+        bypassed = code == 0 and [m["session"] for m in doc.get("result", {}).get("merged", [])] == ["p1"]
+        return {"ok": refused and bypassed, "refused_at_once": refused, "tests_run": calls["n"],
+                "refused_seconds": round(refused_seconds, 1), "error_excerpt": error[:160],
+                "published_after_bypass": bypassed}
+    finally:
+        github_api(token, "DELETE", protection)
+
+
+def scenario_throughput(repo: Path, branch: str, publishes: int = 10) -> dict[str, Any]:
+    instance = gate.Gate(repo)
+    holds, totals = [], []
+    for n in range(publishes):
+        agent(repo, f"t{n}", {f"e2e/throughput_{n}.txt": f"{n}\n"})
+        before = instance.counters()
+        started = time.perf_counter()
+        code, doc = run_gate(repo, "queue")
+        totals.append(time.perf_counter() - started)
+        after = instance.counters()
+        if code != 0 or after.get("publishes", 0) - before.get("publishes", 0) != 1:
+            return {"ok": False, "error": f"publish {n} failed: {doc}"}
+        holds.append((after.get("publish_hold_ms", 0) - before.get("publish_hold_ms", 0)) / 1000)
+    holds.sort()
+    p95 = holds[min(len(holds) - 1, round(0.95 * (len(holds) - 1)))]
+    median = statistics.median(holds)
+    return {"ok": True, "publishes": publishes, "lock_hold_median_s": round(median, 2),
+            "lock_hold_p95_s": round(p95, 2), "queue_run_median_s": round(statistics.median(totals), 2),
+            "ceiling_merges_per_day_at_batch_8": int(86400 / p95 * 8)}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("remote_url", help="push-able remote, e.g. https://github.com/OWNER/REPO.git")
     parser.add_argument("--keep", action="store_true", help="keep the remote branch for inspection")
     args = parser.parse_args()
-    branch = f"gate-e2e/{uuid.uuid4().hex[:8]}"
+    branch = f"gate-e2e-{uuid.uuid4().hex[:8]}"
     work = Path(tempfile.mkdtemp(prefix="gate-e2e-"))
     repo = work / "repo"
     shown_url = re.sub(r"//[^/@]+@", "//***@", args.remote_url)  # never print credentials
@@ -174,6 +255,10 @@ def main() -> int:
         started = time.perf_counter()
         for name, scenario in (("batch", scenario_batch), ("crash", scenario_crash), ("race", scenario_race)):
             summary[name] = scenario(repo, branch)
+        set_test_command(repo, branch, f"{PY} -c pass")
+        slug_match = re.search(r"github\.com[/:]([^/]+/[^/.]+?)(?:\.git)?/?$", args.remote_url)
+        summary["protected"] = scenario_protected(repo, branch, slug_match.group(1) if slug_match else None)
+        summary["throughput"] = scenario_throughput(repo, branch)
         summary["total_seconds"] = round(time.perf_counter() - started, 1)
     except Exception as error:  # report, then clean up
         summary["error"] = re.sub(r"//[^/@]+@", "//***@", f"{type(error).__name__}: {error}")
@@ -183,7 +268,8 @@ def main() -> int:
                 git(repo, "push", "-q", "origin", f":refs/heads/{branch}")
                 summary["remote_branch_deleted"] = True
         shutil.rmtree(work, ignore_errors=True)
-    passed = "error" not in summary and all(summary[name]["ok"] for name in ("batch", "crash", "race"))
+    passed = "error" not in summary and all(
+        summary[name]["ok"] is not False for name in ("batch", "crash", "race", "protected", "throughput"))
     summary["passed"] = passed
     print(json.dumps(summary, indent=2))
     return 0 if passed else 1
