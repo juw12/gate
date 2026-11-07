@@ -617,19 +617,77 @@ class GateTest(unittest.TestCase):
         for (_, left), (entered, _) in zip(intervals, intervals[1:], strict=False):
             self.assertLessEqual(left, entered)
 
+    def heartbeat(self, lock: Path, owner: str, skew_s: float = 0.0) -> threading.Event:
+        """Play a live lock holder whose clock is off by skew_s: rewrite the lock's mtime every 50 ms."""
+        lock.write_text(owner)
+        stop = threading.Event()
+
+        def beat() -> None:
+            while not stop.wait(0.05):
+                stamp = time.time() + skew_s
+                with contextlib.suppress(OSError):
+                    os.utime(lock, (stamp, stamp))
+
+        threading.Thread(target=beat, daemon=True).start()
+        self.addCleanup(stop.set)
+        return stop
+
     def test_lock_held_by_live_or_remote_owner_blocks(self):
+        """A heartbeating holder keeps its lock whatever its clock says: liveness is judged by change."""
         self.make_repo()
         state = self.repo / ".git" / "gate"
         state.mkdir(parents=True, exist_ok=True)
         self.assertEqual(self.agent("l1", self.feature(1))[0], 0)
         lock = state / "lane-default.lock"
-        for owner in (f"{os.getpid()} {gate.socket.gethostname()}", "4242 some-other-host"):
-            lock.write_text(owner)
-            code, out = self.gate("--json", "queue", "--wait", "0.2")
-            self.assertEqual(code, gate.EXIT_ERROR, out)
-            self.assertIn("lock is held", json.loads(out)["error"])
-            self.assertEqual(self.session("l1")["status"], "queued")
+        holders = {
+            "live process on this host": (f"{os.getpid()} {gate.socket.gethostname()}", 0.0),
+            "other host, clock 5 min behind": ("4242 some-other-host", -300.0),
+            "other host, clock 5 min ahead": ("4242 some-other-host", 300.0),
+        }
+        for label, (owner, skew) in holders.items():
+            with self.subTest(label):
+                stop = self.heartbeat(lock, owner, skew)
+                code, out = self.gate("--json", "queue", "--wait", "0.3")
+                stop.set()
+                self.assertEqual(code, gate.EXIT_ERROR, out)
+                self.assertIn("lock is held", json.loads(out)["error"])
+                self.assertEqual(self.session("l1")["status"], "queued")
+                self.assertEqual(lock.read_text(), owner)
         lock.unlink()
+
+    def test_silent_foreign_lock_is_taken_over_after_observation(self):
+        """A lock from another host that stops changing is taken over after LOCK_STALE_S of watching,
+        even if its timestamp is in the future (skewed clock) and even with a shorter --wait."""
+        self.make_repo()
+        state = self.repo / ".git" / "gate"
+        state.mkdir(parents=True, exist_ok=True)
+        self.assertEqual(self.agent("s1", self.feature(1))[0], 0)
+        lock = state / "lane-default.lock"
+        lock.write_text("4242 crashed-host")
+        future = time.time() + 300
+        os.utime(lock, (future, future))
+        started = time.monotonic()
+        with mock.patch.object(gate, "LOCK_STALE_S", 0.5):
+            code, out = self.gate("queue", "--wait", "0.1")
+        elapsed = time.monotonic() - started
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.session("s1")["status"], "merged")
+        self.assertGreaterEqual(elapsed, 0.5, "must watch the lock for LOCK_STALE_S before breaking it")
+
+    def test_lock_abandoned_long_ago_is_taken_over_at_once(self):
+        self.make_repo()
+        state = self.repo / ".git" / "gate"
+        state.mkdir(parents=True, exist_ok=True)
+        self.assertEqual(self.agent("a1", self.feature(1))[0], 0)
+        lock = state / "lane-default.lock"
+        lock.write_text("4242 decommissioned-host")
+        old = time.time() - 11 * gate.LOCK_STALE_S
+        os.utime(lock, (old, old))
+        started = time.monotonic()
+        code, out = self.gate("queue", "--wait", "0")
+        self.assertEqual(code, 0, out)
+        self.assertLess(time.monotonic() - started, gate.LOCK_STALE_S / 2)
+        self.assertEqual(self.session("a1")["status"], "merged")
 
     def test_pid_alive(self):
         self.assertTrue(gate.pid_alive(os.getpid()))
@@ -825,6 +883,214 @@ class GateTest(unittest.TestCase):
         code, out = self.gate("--json", "submit", "big2", "--model", "m")
         self.assertEqual(code, gate.EXIT_POLICY, out)
         self.assertEqual(json.loads(out)["result"]["status"], "too_large")
+
+
+    # ------------------------------------------------------------ publish failures
+    def test_push_rejected_by_the_remote_is_reported_once_not_retried(self):
+        """A protected branch (here: a pre-receive hook) is not contention: report it at once, keep the
+        session queued, run the tests once, and leave the remote untouched."""
+        self.make_repo(remote=True)
+        hook = self.origin / "hooks" / "pre-receive"
+        hook.write_bytes(b"#!/bin/sh\necho 'GH006: Protected branch update failed for refs/heads/main.' >&2\nexit 1\n")
+        hook.chmod(0o755)
+        before = run_git("--git-dir", str(self.origin), "rev-parse", "main", cwd=self.tmp).strip()
+        self.assertEqual(self.agent("p1", self.feature(1))[0], 0)
+        original = gate.Gate.run_tests
+        calls = {"n": 0}
+
+        def counting_run_tests(gate_self, commit, changed=None):
+            calls["n"] += 1
+            return original(gate_self, commit, changed)
+
+        with mock.patch.object(gate.Gate, "run_tests", counting_run_tests):
+            code, out = self.gate("--json", "queue", "--drain")
+        self.assertEqual(code, gate.EXIT_ERROR, out)
+        error = json.loads(out)["error"]
+        self.assertIn("rejected the push", error)
+        self.assertIn("Protected branch", error)
+        self.assertNotIn("kept moving", error)
+        self.assertEqual(calls["n"], 1, "a refusal that a retry cannot fix must not re-test the batch")
+        self.assertEqual(self.session("p1")["status"], "queued")
+        self.assertEqual(run_git("--git-dir", str(self.origin), "rev-parse", "main", cwd=self.tmp).strip(), before)
+
+    def test_target_checked_out_elsewhere_is_never_moved(self):
+        self.make_repo(remote=True)
+        checkout = self.tmp / "human-checkout"
+        run_git("worktree", "add", "-q", str(checkout), "main", cwd=self.repo)
+        instance = gate.Gate(self.repo)
+        tip = instance.rev("refs/heads/main")
+        with self.assertRaises(gate.GateError) as caught:
+            instance.advance(tip, tip)
+        self.assertIn("checked out", str(caught.exception))
+        outsider = self.tmp / "outsider"
+        run_git("clone", "-q", str(self.origin), str(outsider), cwd=self.tmp)
+        (outsider / "docs" / "new.md").write_text("new\n")
+        run_git("add", ".", cwd=outsider)
+        run_git("-c", "user.name=H", "-c", "user.email=h@x", "commit", "-qm", "remote move", cwd=outsider)
+        run_git("push", "-q", "origin", "main", cwd=outsider)
+        with self.assertRaises(gate.GateError):
+            instance.sync_tip()
+        self.assertEqual(instance.rev("refs/heads/main"), tip, "checked-out branch must not move")
+
+    def test_merge_tree_failure_is_reported(self):
+        self.make_repo()
+        self.assertEqual(self.agent("m1", self.feature(1))[0], 0)
+        instance = gate.Gate(self.repo)
+        instance.update("m1", head="0" * 40)  # e.g. objects lost from a corrupted repository
+        code, out = self.gate("queue")
+        self.assertEqual(code, gate.EXIT_ERROR, out)
+        self.assertIn("merge-tree failed", out)
+
+    # ------------------------------------------------------------ retention and durability
+    def test_gc_never_abandons_a_session_resubmitted_meanwhile(self):
+        self.make_repo(overrides={"reject_grace_hours": "0"})
+        self.assertEqual(self.agent("r1", {"calc.py": CALC.replace("return a - b", "return a + b")})[0], 0)
+        self.gate("queue")
+        self.assertEqual(self.session("r1")["status"], "rejected")
+        real_archive = gate.Gate.archive
+
+        def archive_then_agent_resubmits(gate_self, session):
+            path = real_archive(gate_self, session)
+            gate_self.update(session["id"], status="queued", head="f" * 40)  # fixed and resubmitted
+            return path
+
+        with mock.patch.object(gate.Gate, "archive", archive_then_agent_resubmits):
+            code, out = self.gate("--json", "gc")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.session("r1")["status"], "queued")
+        self.assertIn("agent/r1", run_git("for-each-ref", "refs/heads/agent/", cwd=self.repo))
+        code, out = self.gate("--json", "gc")  # unchanged rejected sessions are still collected
+        self.assertEqual(code, 0, out)
+
+    def test_atomic_write_never_leaves_a_partial_file(self):
+        target = self.tmp / "state.json"
+        target.write_text("old")
+        with mock.patch.object(gate.os, "replace", side_effect=OSError("disk full")), \
+                self.assertRaises(OSError):
+            gate.write_atomic(target, b"new")
+        self.assertEqual(target.read_text(), "old")
+        self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), ["state.json"])
+        gate.write_atomic(target, b"new")
+        self.assertEqual(target.read_text(), "new")
+
+    def test_scanner_timeout_fails_closed(self):
+        scanner = self.tmp / "slow_scanner.py"
+        scanner.write_text("import time\ntime.sleep(30)\n")
+        self.make_repo(overrides={"secret_scan_command": f"'\"{PY}\" \"{scanner}\" {{file}}'"})
+        with mock.patch.object(gate, "SCAN_TIMEOUT_S", 0.5):
+            finding = gate.Gate(self.repo).external_scan("hello\n")
+        self.assertIsNotNone(finding)
+        self.assertIn("timed out", finding)
+
+    def test_verify_without_green_baseline_needs_a_human(self):
+        self.make_repo()
+        self.commit_on_main({"calc.py": CALC.replace("return a - b", "return a + b")}, "break main")
+        code, out = self.gate("--json", "verify")
+        self.assertEqual(code, gate.EXIT_NEEDS_HUMAN, out)
+        doc = json.loads(out)
+        self.assertEqual(doc["result"]["status"], "red")
+        self.assertIsNone(doc["result"]["last_green"])
+
+    # ------------------------------------------------------------ real process kills
+    def run_killed(self, fault: str, *argv: str) -> subprocess.CompletedProcess:
+        """Run gate in a child process that kills itself (SIGKILL / TerminateProcess) at a fault point."""
+        env = {**os.environ, "GATE_FAULT": fault}
+        proc = subprocess.run([PY, gate.__file__, "-C", str(self.repo), *argv], env=env,
+                              capture_output=True, text=True, timeout=300)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return proc
+
+    def test_real_kill_after_publish_recovers_without_duplicates(self):
+        self.make_repo()
+        for n in (1, 2):
+            self.assertEqual(self.agent(f"k{n}", self.feature(n))[0], 0)
+        self.run_killed("after-publish", "queue", "--drain")
+        self.assertEqual(self.session("k1")["status"], "queued")  # published, never recorded
+        self.assertTrue((self.repo / ".git" / "gate" / "lane-default.lock").exists(), "lock left behind")
+        published = run_git("log", "--format=%H", "main", cwd=self.repo).split()
+        self.assertIn("Agent-Session: k1", self.main_log())
+
+        code, out = self.gate("--json", "queue", "--drain", "--wait", "1")
+        self.assertEqual(code, 0, out)
+        doc = json.loads(out)
+        self.assertEqual(sorted(item["session"] for item in doc["result"]["recovered"]), ["k1", "k2"])
+        self.assertEqual(run_git("log", "--format=%H", "main", cwd=self.repo).split(), published)
+        for n in (1, 2):
+            self.assertEqual(self.main_log().count(f"Agent-Session: k{n}\n"), 1)
+            self.assertTrue(self.session(f"k{n}")["recovered"])
+
+    def test_real_kill_after_revert_publish_is_recorded_by_the_next_verify(self):
+        self.make_repo()
+        self.assertEqual(self.gate("verify")[0], 0)
+        self.agent("evil", {"calc.py": CALC.replace("return a - b", "return a + b")})
+        with mock.patch.object(gate.Gate, "run_tests", lambda *a, **k: (True, "pretend")):
+            self.gate("queue", "--drain")
+        self.assertEqual(self.session("evil")["status"], "merged")
+        self.run_killed("after-revert-publish", "verify")
+        self.assertIn("Reverts:", run_git("log", "-1", "--format=%B", "main", cwd=self.repo))
+        self.assertEqual(self.session("evil")["status"], "merged")  # revert published, never recorded
+
+        code, out = self.gate("--json", "verify", "--wait", "1")
+        self.assertEqual(code, 0, out)
+        doc = json.loads(out)
+        self.assertEqual(doc["result"]["recovered"], ["evil"])
+        self.assertEqual(doc["result"]["status"], "green")
+        self.assertEqual(self.session("evil")["status"], "reverted")
+        self.assertEqual(run_git("log", "--format=%B", "main", cwd=self.repo).count("Reverts:"), 1)
+
+    # ------------------------------------------------------------ ergonomics
+    def test_json_flag_works_after_the_subcommand(self):
+        self.make_repo()
+        code, out = self.gate("status", "--json")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(json.loads(out)["command"], "status")
+        code, out = self.gate("--json", "status")
+        self.assertEqual(json.loads(out)["command"], "status")
+
+    def test_completion_scripts_cover_every_command(self):
+        for shell in ("bash", "zsh", "fish"):
+            with self.subTest(shell):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(gate.main(["completion", shell]), 0)
+                script = out.getvalue()
+                for command in gate.COMMANDS:
+                    self.assertIn(command, script)
+                self.assertIn("drain", script)
+                if shell == "bash" and sys.platform != "win32" and shutil.which("bash"):
+                    checked = subprocess.run(["bash", "-n"], input=script, capture_output=True, text=True)
+                    self.assertEqual(checked.returncode, 0, checked.stderr)
+
+    def test_doctor_fix_detaches_a_clean_main_checkout(self):
+        self.make_repo()
+        run_git("switch", "-q", "main", cwd=self.repo)
+        code, out = self.gate("doctor")
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("doctor --fix", out)
+        code, out = self.gate("doctor", "--fix")
+        self.assertEqual(code, 0, out)
+        self.assertIn("detached", out)
+        detached = subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=self.repo, capture_output=True)
+        self.assertNotEqual(detached.returncode, 0)
+
+    def test_tracked_text_files_are_clean_utf8(self):
+        """No byte-order marks and no mojibake (UTF-8 decoded as cp1252 and re-encoded)."""
+        here = Path(__file__).resolve().parent
+        listing = subprocess.run(["git", "ls-files"], cwd=here, capture_output=True, text=True)
+        if listing.returncode != 0:
+            self.skipTest("not a git checkout")
+        markers = ["\u00e2\u20ac", "\u00c3", "\u00e2\u2030", "\u00c2\u00a0", "\ufffd"]
+        suffixes = {".md", ".py", ".toml", ".yml", ".yaml", ".html", ".txt", ".cfg"}
+        for name in listing.stdout.split():
+            path = here / name
+            if path.suffix not in suffixes or not path.exists():
+                continue
+            data = path.read_bytes()
+            with self.subTest(name):
+                self.assertFalse(data.startswith(b"\xef\xbb\xbf"), "UTF-8 byte-order mark")
+                text = data.decode("utf-8")
+                for marker in markers:
+                    self.assertNotIn(marker, text, f"mojibake {marker!r}")
 
 
 if __name__ == "__main__":

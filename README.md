@@ -1,4 +1,4 @@
-﻿# gate
+# gate
 
 [![ci](https://github.com/juw12/gate/actions/workflows/ci.yml/badge.svg)](https://github.com/juw12/gate/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/juw12/gate)](https://github.com/juw12/gate/releases)
@@ -23,7 +23,7 @@ needs a human.
 
 Demo page with a recorded run: https://juw12.github.io/gate/
 
-Standard library only. Python â‰¥ 3.11, Git â‰¥ 2.40.
+Standard library only. Python ≥ 3.11, Git ≥ 2.40.
 
 ## How it works
 
@@ -31,7 +31,7 @@ Standard library only. Python â‰¥ 3.11, Git â‰¥ 2.40.
 flowchart LR
   A1[agent session] -- spawn / commit --> B[agent/&lt;id&gt; branch]
   A2[agent in remote sandbox] -- push --> B
-  B -- submit --> P{policy<br/>secrets Â· size Â· risk tier}
+  B -- submit --> P{policy<br/>secrets · size · risk tier}
   P -- bounced, exit 2 --> A1
   P -- tier 2 --> H[human: gate approve]
   P -- queued --> L[lane queue]
@@ -142,15 +142,15 @@ pid, a long-running holder, a lock that changed hands, and 24 contenders racing 
 ## Measured
 
 Unit/e2e: `python -m unittest -v test_gate`, 40 tests on real repos (crash recovery, contended locks, JSON interface,
-remote races, verify/revert, secrets). CI also enforces `ruff`, `mypy` and â‰¥ 85 % line coverage of `gate.py`.
+remote races, verify/revert, secrets). CI also enforces `ruff`, `mypy` and ≥ 85 % line coverage of `gate.py`.
 
 Throughput, from `python bench.py --sessions 160 --lanes 8 --test-seconds 2 --batch 8` on one Windows laptop
 (Git 2.55, Python 3.13), with a 2 s sleep standing in for CI:
 
 | `--parallel` | wall | merges/day (extrapolated) | commuted publishes | publish-lock hold | ceiling of the serialized step |
 |---|---|---|---|---|---|
-| 1 | 109.5 s | 126 k | 0 / 24 | 87 ms | â€” |
-| 8 | 45.9 s | 301 k | 22 / 24 | 1.4 s per 6.7 merges | â‰ˆ 408 k/day |
+| 1 | 109.5 s | 126 k | 0 / 24 | 87 ms | — |
+| 8 | 45.9 s | 301 k | 22 / 24 | 1.4 s per 6.7 merges | ≈ 408 k/day |
 
 The serialized publish step stops being the limit at about 400k merges/day on this hardware.
 Above that, throughput is set by CI capacity: about \(\text{lanes} \times \text{batch} / \text{test time}\).
@@ -194,7 +194,7 @@ Policy is read from the remote target: a stricter `gate.toml` pushed to the remo
   tested by simulating foreign owners, not on a real NFS cluster. A Scion-class deployment would put session
   state in a database.
 - **Platforms:** CI (`.github/workflows/ci.yml`) runs tests, demo and benchmark on Linux, macOS and
-  Windows Ã— Python 3.11/3.13.
+  Windows × Python 3.11/3.13.
 
 See [CHANGELOG.md](CHANGELOG.md) for releases and [CONTRIBUTING.md](CONTRIBUTING.md) to work on gate.
 MIT licensed.
