@@ -32,7 +32,7 @@ Standard library only. Python ≥ 3.11, Git ≥ 2.40.
 - **Android:** [`gate-android.apk`](https://github.com/juw12/gate/releases/download/android/gate-android.apk): open the file on the phone and allow your browser to install apps once.
 - **iPhone:** open https://juw12.github.io/gate/ in Safari, tap Share, then **Add to Home Screen**.
 
-The Windows, Mac and Android apps are the web app in its own window ([`desktop/`](desktop/README.md), [`android/`](android/README.md)) and change with it. Each build is opened on GitHub's machines before it is published: on Windows and on a Mac the page loads, the app starts and can store data; on an Android emulator it installs, opens and stays up. They are not code-signed or notarised, and no real phone or PC has run them yet.
+The Windows, Mac and Android apps open the gate site in a window of its own ([`desktop/`](desktop/README.md), [`android/`](android/README.md)) and change with it. gate itself is a command-line tool and a merge check; it is installed as the rest of this README says. Each build is opened on GitHub's machines before it is published: on Windows and on a Mac the page loads, the app starts and can store data; on an Android emulator it installs, opens and stays up. They are not code-signed or notarised, and no real phone or PC has run them yet.
 
 ## How it works
 
