@@ -31,6 +31,8 @@ py-modules = ["gate"]
 [tool.ruff]
 line-length = 120
 target-version = "py311"
+# desktop/ and android/ are the stamped window around the site (hone's shells), kept as stamped
+extend-exclude = ["desktop", "android"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "B", "UP", "I"]
