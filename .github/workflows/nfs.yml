@@ -10,6 +10,9 @@ on:
     paths: ["gate.py", "nfs_e2e.py", ".github/workflows/nfs.yml"]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   nfs:
     runs-on: ubuntu-latest
